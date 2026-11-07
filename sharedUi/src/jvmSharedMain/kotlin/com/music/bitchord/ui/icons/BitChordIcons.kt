@@ -174,6 +174,10 @@ object BitChordIcons {
         )
     }
 
+    val TabSubscriptions: ImageVector by lazy {
+        TabExplore
+    }
+
     /**
      * Two units lower than the font sets it: the back card's top edge rises
      * just past the em box, and the viewport would clip it flat.
@@ -787,6 +791,32 @@ object BitChordIcons {
 
                 moveTo(4.5f, 17.5f); lineTo(5.5f, 17.5f)
                 moveTo(9.5f, 17.5f); lineTo(19.5f, 17.5f)
+            }
+        }.build()
+    }
+
+    val Pip: ImageVector by lazy {
+        ImageVector.Builder(
+            name = "bc_pip",
+            defaultWidth = 24.dp, defaultHeight = 24.dp,
+            viewportWidth = 24f, viewportHeight = 24f,
+        ).apply {
+            path(
+                stroke = stroke,
+                strokeLineWidth = STROKE,
+                strokeLineCap = StrokeCap.Round,
+                strokeLineJoin = StrokeJoin.Round,
+            ) {
+                moveTo(3f, 5f)
+                lineTo(21f, 5f)
+                lineTo(21f, 19f)
+                lineTo(3f, 19f)
+                close()
+                moveTo(11.5f, 11.5f)
+                lineTo(19f, 11.5f)
+                lineTo(19f, 17f)
+                lineTo(11.5f, 17f)
+                close()
             }
         }.build()
     }

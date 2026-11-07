@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.music.bitchord.R
 import com.music.bitchord.auth.AuthStore
+import com.music.bitchord.auth.BrowserSession
 import com.music.bitchord.auth.SignedIn
 import com.music.bitchord.auth.GoogleAccountSession
 import com.music.bitchord.auth.YouTubeProfile
@@ -172,6 +173,10 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
 
     private val _explore = MutableStateFlow<UiState<List<MoodGenreSection>>>(UiState.Loading)
     val explore: StateFlow<UiState<List<MoodGenreSection>>> = _explore.asStateFlow()
+
+    private val _subscriptions = MutableStateFlow<UiState<List<HomeShelf>>>(UiState.Loading)
+    val subscriptions: StateFlow<UiState<List<HomeShelf>>> = _subscriptions.asStateFlow()
+    private var subscriptionsRequested = false
 
     private val _selectedMoodGenre = MutableStateFlow<MoodGenre?>(null)
     val selectedMoodGenre: StateFlow<MoodGenre?> = _selectedMoodGenre.asStateFlow()
@@ -1464,9 +1469,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // and the dozen-odd artwork browses after it went out at launch with
         // Home's own requests, to the same host, for a page not yet opened.
         if (_signedIn.value) {
-            loadLibrary()
-            loadAccount()
-            loadPlaylists()
+            val cleanCookie = BrowserSession.cleanYouTubeCookies()
+            val currentSession = authStore.activeSession
+            if (cleanCookie != null && currentSession != null && (cleanCookie != currentSession.cookie || currentSession.name == "YouTube User")) {
+                val updated = currentSession.copy(cookie = cleanCookie)
+                authStore.upsertSession(updated)
+                Innertube.cookie = cleanCookie
+                authStore.cookie = cleanCookie
+                viewModelScope.launch {
+                    reloadForAccount()
+                    loadChannels(force = true)
+                }
+            } else {
+                loadLibrary()
+                loadAccount()
+                loadPlaylists()
+            }
         }
         viewModelScope.launch {
             // drop(1): the current value is just the count so far, not a play.
@@ -1589,7 +1607,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
      * as one flag: a pull on Library while Home is still refreshing in the
      * background shouldn't leave the wrong tab showing a loader.
      */
-    enum class Feed { HOME, EXPLORE, LIBRARY }
+    enum class Feed { HOME, SUBSCRIPTIONS, EXPLORE, LIBRARY }
 
     private val _refreshing = MutableStateFlow(emptySet<Feed>())
     val refreshing: StateFlow<Set<Feed>> = _refreshing.asStateFlow()
@@ -1608,11 +1626,32 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             when (feed) {
                 Feed.HOME -> refreshHome(identity)
+                Feed.SUBSCRIPTIONS -> fetchSubscriptions()
                 Feed.EXPLORE -> fetchExplore()
                 Feed.LIBRARY -> fetchLibrary(identity)
             }
             _refreshing.value = _refreshing.value - feed
         }
+    }
+
+    fun onSubscriptionsShown() {
+        if (!subscriptionsRequested) loadSubscriptions()
+    }
+
+    fun loadSubscriptions() {
+        subscriptionsRequested = true
+        _subscriptions.value = UiState.Loading
+        viewModelScope.launch { fetchSubscriptions() }
+    }
+
+    private suspend fun fetchSubscriptions() {
+        val state = YtMusicRepository.subscriptions().fold(
+            onSuccess = { shelves ->
+                UiState.Success(shelves)
+            },
+            onFailure = { UiState.Error(it.friendly()) },
+        )
+        _subscriptions.value = state
     }
 
     fun loadExplore() {
@@ -1711,7 +1750,8 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         // out: it has its own skeleton at the head of the page rather than the
         // one at the tail.
         _homePendingShelves.value = 1 + YtMusicRepository.HOME_SUPPLEMENT_BROWSE_IDS.size
-        loadTopPicks(identity, rebuild = false)
+        _topPicks.value = null
+        _topPicksLoading.value = false
         viewModelScope.launch {
             launch {
                 try {
@@ -1853,6 +1893,9 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
     private fun homeShelfRequestSettled(identity: String?, generation: Long) {
         if (!isCurrentHomeLoad(identity, generation)) return
         _homePendingShelves.value = (_homePendingShelves.value - 1).coerceAtLeast(0)
+        if (_homePendingShelves.value == 0 && _home.value is UiState.Loading) {
+            _home.value = UiState.Success(emptyList())
+        }
     }
 
     private fun isCurrentHomeLoad(identity: String?, generation: Long) =
@@ -1872,15 +1915,13 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
         }
         val added = shelves.withoutRepeatsOf(existing)
             .filter { homeSeenTitles.add(it.title.lowercase(Locale.ROOT)) }
-        if (added.isNotEmpty()) _home.value = UiState.Success(existing + added)
+        _home.value = UiState.Success(existing + added)
     }
 
     /** Refreshes the core feed without blanking the current Play page first. */
     private suspend fun refreshHome(identity: String?) = coroutineScope {
         val recent = if (_signedIn.value) async { YtMusicRepository.homeRecentlyPlayed() } else null
-        // Top Picks keeps to its hour; a pull refreshes the feed, not the
-        // picks, unless the hour has already turned over.
-        if (topPicksJob?.isActive != true) loadTopPicks(identity, rebuild = false)
+        _topPicks.value = null
         YtMusicRepository.home().onSuccess { feed ->
             if (identity != listenerKey()) return@onSuccess
             homeContinuation = feed.continuation
@@ -2803,10 +2844,22 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                             subscriberCountText = page.subscriberCountText
                             monthlyListenerCount = page.monthlyListenerCount
                             subscription = page.subscription
-                            if (page.songs.isEmpty()) {
+                            val shelfSongs = sections.flatMap { it.items }.mapNotNull { item ->
+                                item.videoId?.let { vid ->
+                                    Song(
+                                        videoId = vid,
+                                        title = item.title,
+                                        artist = item.subtitle.ifBlank { name ?: title },
+                                        thumbnailUrl = item.thumbnailUrl,
+                                        isVideo = item.isVideo,
+                                    )
+                                }
+                            }
+                            val allSongs = (page.songs + shelfSongs).distinctBy { it.videoId }
+                            if (allSongs.isEmpty() && sections.isEmpty()) {
                                 UiState.Error(text(R.string.no_tracks_here))
                             } else {
-                                UiState.Success(page.songs.withArtwork(thumbnailUrl ?: artwork))
+                                UiState.Success(allSongs.withArtwork(thumbnailUrl ?: artwork))
                             }
                         },
                         onFailure = { UiState.Error(it.friendly()) },
@@ -3357,7 +3410,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
             )
             Innertube.selectChannel(session.pageId, session.dataSyncId, session.authUser)
 
-            val account = withTimeoutOrNull(20_000L) {
+            val fetchedAccount = withTimeoutOrNull(10_000L) {
                 var result = YtMusicRepository.account()
                 if (result.isFailure) {
                     delay(750L)
@@ -3365,11 +3418,7 @@ class MainViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 result.getOrNull()
             }
-            if (account == null) {
-                restoreActiveSession(oldAccountId, oldProfileId)
-                onComplete(false)
-                return@launch
-            }
+            val account = fetchedAccount ?: Account(name = "YouTube User", email = "", thumbnailUrl = null)
 
             // A channel switch is another identity under the same Google
             // login, never a new Google account. For a fresh sign-in, matching

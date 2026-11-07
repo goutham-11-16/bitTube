@@ -197,10 +197,38 @@ object MusicVideoEngine {
         }
     }
 
+    private var holdingAudio = false
+
+    private fun holdAudio() {
+        val c = controller ?: return
+        if (!holdingAudio && c.playWhenReady) {
+            holdingAudio = true
+            c.playWhenReady = false
+        }
+    }
+
+    private fun releaseAudio() {
+        if (holdingAudio) {
+            holdingAudio = false
+            controller?.seekTo(0L)
+            controller?.playWhenReady = true
+            player?.playWhenReady = true
+        }
+    }
+
+    fun setScalingMode(fit: Boolean) {
+        player?.videoScalingMode = if (fit) {
+            C.VIDEO_SCALING_MODE_SCALE_TO_FIT
+        } else {
+            C.VIDEO_SCALING_MODE_SCALE_TO_FIT_WITH_CROPPING
+        }
+    }
+
     private val playerListener = object : Player.Listener {
         override fun onRenderedFirstFrame() {
             _frameOn.value = top()
             _shownVideoId.value = loadedId
+            releaseAudio()
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {
@@ -274,8 +302,12 @@ object MusicVideoEngine {
         }
         val exo = ensurePlayer(app)
         if (top() === view) {
-            _frameOn.value = null
             exo.setVideoTextureView(view)
+            if (exo.playbackState == Player.STATE_READY || exo.isPlaying) {
+                _frameOn.value = view
+            } else {
+                _frameOn.value = null
+            }
             repaint()
         }
         refresh()
@@ -287,6 +319,9 @@ object MusicVideoEngine {
             val next = top()
             if (next != null) {
                 exo.setVideoTextureView(next)
+                if (exo.playbackState == Player.STATE_READY || exo.isPlaying) {
+                    _frameOn.value = next
+                }
                 repaint()
             } else {
                 exo.clearVideoTextureView(view)
@@ -302,6 +337,7 @@ object MusicVideoEngine {
         .build()
         .apply {
             volume = 0f
+            videoScalingMode = C.VIDEO_SCALING_MODE_SCALE_TO_FIT
             trackSelectionParameters = trackSelectionParameters.buildUpon()
                 .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
                 .build()
@@ -317,10 +353,10 @@ object MusicVideoEngine {
         }
     }
 
-    /** The track the picture should be of: the controller's, when it is a music video. */
+    /** The track the picture should be of: the controller's, when it has a videoId. */
     private fun wanted(): Song? {
         val song = controller?.currentMediaItem?.toSong() ?: return null
-        return song.takeIf { it.isVideo && it.videoId !in noPicture }
+        return song.takeIf { it.videoId.isNotEmpty() && it.videoId !in noPicture }
     }
 
     private fun refresh() {
@@ -368,6 +404,41 @@ object MusicVideoEngine {
             .filterIsInstance<HttpDataSource.InvalidResponseCodeException>()
             .any { it.responseCode in REFUSAL_CODES }
 
+    private suspend fun resolveNewPipeVideo(videoId: String, cap: Int): InnerTubeXResolver.VideoStream? =
+        withContext(Dispatchers.IO) {
+            try {
+                val extractor = org.schabi.newpipe.extractor.ServiceList.YouTube.getStreamExtractor(
+                    "https://www.youtube.com/watch?v=$videoId",
+                )
+                extractor.fetchPage()
+                val allVideoStreams = (extractor.videoStreams.orEmpty() + extractor.videoOnlyStreams.orEmpty())
+                    .filter { !it.content.isNullOrBlank() }
+                if (allVideoStreams.isEmpty()) return@withContext null
+
+                val stream = allVideoStreams
+                    .filter { it.height > 0 }
+                    .sortedByDescending { it.height }
+                    .firstOrNull { it.height <= cap }
+                    ?: allVideoStreams.minByOrNull { abs(it.height - cap) }
+                    ?: allVideoStreams.first()
+
+                val availableHeights = allVideoStreams.map { it.height }.filter { it > 0 }.distinct().sortedDescending()
+                InnerTubeXResolver.VideoStream(
+                    videoId = videoId,
+                    url = stream.content,
+                    width = if (stream.height > 0) (stream.height * 16) / 9 else 1920,
+                    height = if (stream.height > 0) stream.height else 1080,
+                    mimeType = stream.format?.mimeType ?: "video/mp4",
+                    headers = emptyMap(),
+                    heights = if (availableHeights.isNotEmpty()) availableHeights else listOf(720, 480, 360),
+                    profileId = "newpipe_fallback",
+                )
+            } catch (e: Exception) {
+                TrackLog.w(TAG, "NewPipe video fallback failed for $videoId: ${e.message}", about = videoId)
+                null
+            }
+        }
+
     /**
      * [videoId]'s picture, asked plainly and then — when that found nothing —
      * as age-restricted, which InnerTubeX needs told: see
@@ -386,9 +457,10 @@ object MusicVideoEngine {
             if (plain != null) return plain
             TrackLog.d(TAG, "video: nothing asked plainly; asking as age-restricted", about = videoId)
         }
-        return withContext(Dispatchers.IO) {
+        val resolved = withContext(Dispatchers.IO) {
             InnerTubeXResolver.extractVideo(videoId, cap, skip, ageRestricted = true)
         }?.also { ageGated += videoId }
+        return resolved ?: resolveNewPipeVideo(videoId, cap)
     }
 
     private fun load(videoId: String) {
@@ -396,13 +468,25 @@ object MusicVideoEngine {
         loadedId = videoId
         val cap = capFor(videoId)
         loadedCap = cap
+        val isAtStart = (controller?.currentPosition ?: 0L) < 5000L
+        if (isAtStart && wanted() != null) {
+            holdAudio()
+        }
         loadJob = scope.launch {
+            // Safety timeout: if video does not render first frame within 10 seconds, release audio
+            val watchdog = launch {
+                delay(10000L)
+                releaseAudio()
+            }
             val stream = try {
                 cachedStream(videoId, cap)
                     ?: resolve(videoId, cap)?.also { streams[videoId] = Triple(it, cap, System.currentTimeMillis()) }
             } catch (e: CancellationException) {
+                watchdog.cancel()
                 throw e
             } catch (e: StreamResolveException) {
+                watchdog.cancel()
+                releaseAudio()
                 TrackLog.w(TAG, "video: no picture (${e.reason}): ${e.message}", about = videoId)
                 if (loadedId != videoId) return@launch
                 loadedId = null
@@ -412,30 +496,41 @@ object MusicVideoEngine {
                 if (e.reason != StreamResolveException.Reason.NETWORK) noPicture += videoId
                 return@launch
             } catch (e: Exception) {
+                watchdog.cancel()
+                releaseAudio()
                 // Not remembered as pictureless: the next surface or track
                 // change asks again.
                 TrackLog.w(TAG, "video: couldn't resolve the picture: ${e.message}", about = videoId)
                 if (loadedId == videoId) loadedId = null
                 return@launch
             }
-            if (loadedId != videoId) return@launch
-            // A catalogue track's "video" is its cover held still; nothing to show.
-            if (stream == null || stream.aspect < MIN_VIDEO_ASPECT) {
+            if (loadedId != videoId) {
+                watchdog.cancel()
+                releaseAudio()
+                return@launch
+            }
+            if (stream == null) {
+                watchdog.cancel()
+                releaseAudio()
                 noPicture += videoId
                 loadedId = null
                 return@launch
             }
-            val exo = player ?: return@launch
+            val exo = player ?: run {
+                watchdog.cancel()
+                releaseAudio()
+                return@launch
+            }
             val upstream = OkHttpDataSource.Factory(Http.client)
                 .setDefaultRequestProperties(stream.headers)
             val source = ProgressiveMediaSource.Factory(ChunkedDataSource.Factory(upstream, CHUNK_BYTES))
                 .createMediaSource(MediaItem.fromUri(stream.url))
-            if (stream.aspect > 0f) _aspect.value = stream.aspect
+            _aspect.value = if (stream.aspect > 0.5f) stream.aspect else 16f / 9f
             _quality.value = _quality.value.copy(heights = stream.heights, activeHeight = stream.height)
             loadedProfile = stream.profileId
-            val start = controller?.currentPosition?.coerceAtLeast(0L) ?: 0L
-            exo.setMediaSource(source, start + seekLeadMs)
-            exo.playWhenReady = controller?.isPlaying == true
+            val start = if (holdingAudio) 0L else (controller?.currentPosition?.coerceAtLeast(0L) ?: 0L)
+            exo.setMediaSource(source, start + if (holdingAudio) 0L else seekLeadMs)
+            exo.playWhenReady = true
             exo.prepare()
             lastSeekAt = System.currentTimeMillis()
             seekStartedAt = lastSeekAt
@@ -453,6 +548,7 @@ object MusicVideoEngine {
     }
 
     private fun unload() {
+        releaseAudio()
         loadJob?.cancel()
         loadJob = null
         syncJob?.cancel()
@@ -577,6 +673,7 @@ internal fun AndroidMusicVideo(
     // only while it plays, and only on the surface its frames are reaching.
     val awake = rendered && playing
     LaunchedEffect(view, awake) { view?.keepScreenOn = awake }
+    LaunchedEffect(fit) { MusicVideoEngine.setScalingMode(fit) }
 
     val report by rememberUpdatedState(onRenderedChanged)
     LaunchedEffect(rendered) { report(rendered) }
@@ -596,14 +693,15 @@ internal fun AndroidMusicVideo(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.MATCH_PARENT,
                     )
-                    // Blend rather than punch a hole: the still art stays
-                    // visible underneath for the length of the fade.
                     isOpaque = false
-                    this.alpha = 0f
+                    this.alpha = 1f
                     view = this
                 }
             },
-            update = { it.alpha = alpha },
+            update = {
+                it.alpha = 1f
+                it.requestLayout()
+            },
             onRelease = { if (view === it) view = null },
             // The picture at its own shape: letterboxed into the bounds, or
             // overflowing them and cropped by the clip above.
@@ -616,10 +714,12 @@ internal fun AndroidMusicVideo(
                 }
                 val boundsAspect = width.toFloat() / height.coerceAtLeast(1)
                 val wider = boundsAspect > aspect
-                val (w, h) = if (wider == fit) {
-                    (height * aspect).roundToInt() to height
+                val (w, h) = if (fit) {
+                    if (wider) (height * aspect).roundToInt() to height
+                    else width to (width / aspect).roundToInt()
                 } else {
-                    width to (width / aspect).roundToInt()
+                    if (wider) width to (width / aspect).roundToInt().coerceAtLeast(height)
+                    else (height * aspect).roundToInt().coerceAtLeast(width) to height
                 }
                 val placeable = measurable.measure(Constraints.fixed(w.coerceAtLeast(1), h.coerceAtLeast(1)))
                 layout(width, height) {

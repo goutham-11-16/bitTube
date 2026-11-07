@@ -3,12 +3,15 @@ package com.music.bitchord.data.innertube
 import com.music.bitchord.auth.normalizeDataSyncId
 import com.music.bitchord.data.model.Account
 import com.music.bitchord.data.model.AccountChannel
+import com.music.bitchord.data.model.ChannelOwnerInfo
 import com.music.bitchord.data.model.ArtistNameIndex
 import com.music.bitchord.data.model.ArtistPage
 import com.music.bitchord.data.model.ArtistRef
 import com.music.bitchord.data.model.completeArtistCredits
 import com.music.bitchord.data.model.BrowseItem
 import com.music.bitchord.data.model.BrowseType
+import com.music.bitchord.data.model.CommunityPost
+import com.music.bitchord.data.model.PollChoice
 import com.music.bitchord.data.model.HomeShelf
 import com.music.bitchord.data.model.LibraryState
 import com.music.bitchord.data.model.LikeStatus
@@ -16,6 +19,7 @@ import com.music.bitchord.data.model.MoodGenre
 import com.music.bitchord.data.model.MoodGenreSection
 import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.ShelfItem
+import com.music.bitchord.data.model.ShelfLayout
 import com.music.bitchord.data.model.shelfLayoutFor
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.SongMenu
@@ -43,6 +47,22 @@ object InnertubeParser {
 
     // ---- Search -------------------------------------------------------------
 
+    fun parseSearchVideos(response: JsonObject): List<ShelfItem> {
+        val items = mutableListOf<ShelfItem>()
+        fun walk(node: JsonElement) {
+            when (node) {
+                is JsonObject -> {
+                    parseVideoItem(node)?.let { items.add(it) }
+                    node.values.forEach(::walk)
+                }
+                is JsonArray -> node.forEach(::walk)
+                else -> Unit
+            }
+        }
+        walk(response)
+        return items.distinctBy { it.videoId }
+    }
+
     fun parseSearchSongs(response: JsonObject): List<Song> =
         parseSearch(response).filterIsInstance<SearchResult.Track>().map { it.song }
 
@@ -57,59 +77,154 @@ object InnertubeParser {
     fun parseSearch(response: JsonObject): List<SearchResult> = parseSearchPage(response).rows
 
     fun parseSearchPage(response: JsonObject, includeVideos: Boolean = false): SearchPage {
-        // The "All" tab spreads results across several shelf types (card shelf
-        // for the top result, then one shelf per category). Its promoted top
-        // result lives on the card itself, not in a responsive row, so read it
-        // first before walking the ordinary result rows.
-        val topResults: List<SearchResult> = if (includeVideos) emptyList() else {
-            collectRenderers(response, "musicCardShelfRenderer")
-                .mapNotNull { card ->
-                    parseCardShelfSong(card)?.let(SearchResult::TopTrack)
-                        ?: parseCardShelfBrowse(card)?.let(SearchResult::Browse)
-                }
-        }
-        val rows = collectRenderers(response, "musicResponsiveListItemRenderer")
-
-        // The rows tucked inside an artist's promoted card, paired with the
-        // credit that card bills them to — see [cardShelfCredit]. Matched by
-        // identity below, because these are the same renderer objects the walk
-        // above already found; a card row is just a row that also sits here.
-        val cardCredits: List<Pair<JsonObject, Credits>> = if (includeVideos) emptyList() else {
-            collectRenderers(response, "musicCardShelfRenderer").flatMap { card ->
-                val credit = cardShelfCredit(card) ?: return@flatMap emptyList()
-                collectRenderers(card, "musicResponsiveListItemRenderer").map { it to credit }
-            }
-        }
-
         val seen = HashSet<String>()
         val parsed = buildList {
-            topResults.forEach { result ->
-                when (result) {
-                    is SearchResult.TopTrack -> {
-                        // The mixed All page stays music-only; music-video uploads
-                        // belong exclusively to the dedicated Videos tab.
-                        if (!result.song.isVideo && seen.add("v:${result.song.videoId}")) add(result)
-                    }
-                    is SearchResult.Browse -> {
-                        if (seen.add("b:${result.item.browseId}")) add(result)
-                    }
-                    is SearchResult.Track -> Unit
+            // 1. YouTube Web search renderers (videos, compact videos, and lockup items)
+            val videoRenderers = collectRenderers(response, "videoRenderer") +
+                collectRenderers(response, "compactVideoRenderer")
+            videoRenderers.forEach { renderer ->
+                val videoId = renderer.s("videoId") ?: return@forEach
+                val title = renderer.o("title")?.runs() ?: renderer.o("title")?.s("simpleText") ?: ""
+                val artist = renderer.o("ownerText")?.runs()
+                    ?: renderer.o("shortBylineText")?.runs()
+                    ?: renderer.o("longBylineText")?.runs()
+                    ?: ""
+                val thumb = renderer.o("thumbnail")?.a("thumbnails")?.best()
+                val duration = renderer.o("lengthText")?.s("simpleText")
+                val channelThumb = renderer.o("channelThumbnailSupportedRenderers")
+                    .o("channelThumbnailWithLinkRenderer").o("thumbnail").a("thumbnails").best()
+                    ?: renderer.o("channelThumbnail").a("thumbnails").best()
+                val channelBrowseId = renderer.o("navigationEndpoint").o("browseEndpoint").s("browseId")
+                    ?: renderer.o("ownerText").runsEndpoint()
+                    ?: renderer.o("shortBylineText").runsEndpoint()
+                if (title.isNotEmpty() && seen.add("v:$videoId")) {
+                    add(SearchResult.Track(Song(
+                        videoId = videoId,
+                        title = title,
+                        artist = artist,
+                        thumbnailUrl = thumb,
+                        durationText = duration,
+                        isVideo = true,
+                        channelThumbnailUrl = channelThumb,
+                        channelId = channelBrowseId,
+                    )))
                 }
             }
-            rows.forEach { renderer ->
-            // Browse rows are tested first: an album row also carries a
-            // "play album" videoId in its overlay, so checking for a track
-            // first would misread every album as a single song.
-                val browse = parseBrowseItem(renderer)
-                if (browse != null) {
-                    if (seen.add("b:${browse.browseId}")) add(SearchResult.Browse(browse))
-                } else {
-                    val fallback = cardCredits.firstOrNull { it.first === renderer }?.second
-                    parseResponsiveListItem(renderer, fallback ?: Credits())?.let { song ->
-                        // The mixed All page stays music-only; the dedicated Videos
-                        // filter is the one place music-video uploads belong.
-                        if (song.isVideo == includeVideos && seen.add("v:${song.videoId}")) {
-                            add(SearchResult.Track(song))
+
+            // 2. Shorts / Reels
+            val reelRenderers = collectRenderers(response, "reelItemRenderer") +
+                collectRenderers(response, "shortsLockupViewModel")
+            reelRenderers.forEach { renderer ->
+                val videoId = renderer.s("videoId")
+                    ?: renderer.s("entityId")
+                    ?: renderer.o("onTap").o("innertubeCommand").o("reelWatchEndpoint").s("videoId")
+                    ?: return@forEach
+                val title = renderer.o("headline")?.runs()
+                    ?: renderer.o("headline")?.s("simpleText")
+                    ?: renderer.o("overlayMetadata")?.o("primaryText")?.s("content")
+                    ?: ""
+                val thumb = renderer.o("thumbnail")?.a("thumbnails")?.best()
+                if (title.isNotEmpty() && seen.add("v:$videoId")) {
+                    add(SearchResult.Track(Song(
+                        videoId = videoId,
+                        title = title,
+                        artist = "Shorts",
+                        thumbnailUrl = thumb,
+                        isVideo = true,
+                    )))
+                }
+            }
+
+            // 3. Lockup ViewModels (modern YouTube web format)
+            collectRenderers(response, "lockupViewModel").forEach { lockup ->
+                val videoId = lockup.s("contentId")
+                    ?: lockup.o("rendererContext").o("commandContext").o("onTap").o("innertubeCommand").o("watchEndpoint").s("videoId")
+                if (videoId != null && seen.add("v:$videoId")) {
+                    val title = lockup.o("metadata").o("lockupMetadataViewModel").o("title").s("content")
+                        ?: lockup.o("metadata").o("lockupMetadataViewModel").o("title").runs()
+                    val artist = lockup.o("metadata").o("lockupMetadataViewModel").o("metadata").runs()
+                    val thumb = lockup.o("image").a("sources").best()
+                        ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+                    add(SearchResult.Track(Song(
+                        videoId = videoId,
+                        title = title.ifBlank { "Video" },
+                        artist = artist,
+                        thumbnailUrl = thumb,
+                        isVideo = true,
+                    )))
+                }
+            }
+
+            // 4. Channels
+            val channelRenderers = collectRenderers(response, "channelRenderer")
+            channelRenderers.forEach { renderer ->
+                val channelId = renderer.s("channelId") ?: return@forEach
+                val title = renderer.o("title")?.runs() ?: renderer.o("title")?.s("simpleText") ?: ""
+                val thumb = renderer.o("thumbnail")?.a("thumbnails")?.best()
+                if (title.isNotEmpty() && seen.add("b:$channelId")) {
+                    add(SearchResult.Browse(BrowseItem(
+                        browseId = channelId,
+                        title = title,
+                        subtitle = "Channel",
+                        thumbnailUrl = thumb,
+                        type = BrowseType.ARTIST,
+                    )))
+                }
+            }
+
+            // 5. Playlists
+            val playlistRenderers = collectRenderers(response, "playlistRenderer")
+            playlistRenderers.forEach { renderer ->
+                val playlistId = renderer.s("playlistId") ?: return@forEach
+                val title = renderer.o("title")?.runs() ?: renderer.o("title")?.s("simpleText") ?: ""
+                val thumb = renderer.a("thumbnails")?.best()
+                    ?: renderer.o("thumbnail")?.a("thumbnails")?.best()
+                val browseId = if (playlistId.startsWith("VL")) playlistId else "VL$playlistId"
+                if (title.isNotEmpty() && seen.add("b:$browseId")) {
+                    add(SearchResult.Browse(BrowseItem(
+                        browseId = browseId,
+                        title = title,
+                        subtitle = "Playlist",
+                        thumbnailUrl = thumb,
+                        type = BrowseType.PLAYLIST,
+                    )))
+                }
+            }
+
+            // 6. Fallback only if no videos or channels were found
+            if (isEmpty()) {
+                val topResults: List<SearchResult> = if (includeVideos) emptyList() else {
+                    collectRenderers(response, "musicCardShelfRenderer")
+                        .mapNotNull { card ->
+                            parseCardShelfSong(card)?.let(SearchResult::TopTrack)
+                                ?: parseCardShelfBrowse(card)?.let(SearchResult::Browse)
+                        }
+                }
+                val rows = collectRenderers(response, "musicResponsiveListItemRenderer")
+                val cardCredits: List<Pair<JsonObject, Credits>> = if (includeVideos) emptyList() else {
+                    collectRenderers(response, "musicCardShelfRenderer").flatMap { card ->
+                        val credit = cardShelfCredit(card) ?: return@flatMap emptyList()
+                        collectRenderers(card, "musicResponsiveListItemRenderer").map { it to credit }
+                    }
+                }
+
+                topResults.forEach { result ->
+                    when (result) {
+                        is SearchResult.TopTrack -> if (seen.add("v:${result.song.videoId}")) add(result)
+                        is SearchResult.Browse -> if (seen.add("b:${result.item.browseId}")) add(result)
+                        is SearchResult.Track -> Unit
+                    }
+                }
+                rows.forEach { renderer ->
+                    val browse = parseBrowseItem(renderer)
+                    if (browse != null) {
+                        if (seen.add("b:${browse.browseId}")) add(SearchResult.Browse(browse))
+                    } else {
+                        val fallback = cardCredits.firstOrNull { it.first === renderer }?.second
+                        parseResponsiveListItem(renderer, fallback ?: Credits())?.let { song ->
+                            if (seen.add("v:${song.videoId}")) {
+                                add(SearchResult.Track(song.copy(isVideo = true)))
+                            }
                         }
                     }
                 }
@@ -196,16 +311,202 @@ object InnertubeParser {
 
     // ---- Home feed ----------------------------------------------------------
 
-    fun parseHome(response: JsonObject): List<HomeShelf> {
-        val sections = response.o("contents")
-            .o("singleColumnBrowseResultsRenderer").a("tabs")?.firstOrNull()
-            .o("tabRenderer").o("content").o("sectionListRenderer").a("contents")
-            .orEmpty()
+    fun parseVideoItem(node: JsonObject?): ShelfItem? {
+        if (node == null) return null
 
-        return sections.mapNotNull { section ->
-            section.o("musicCarouselShelfRenderer")?.let(::carouselShelf)
-                ?: section.o("musicShelfRenderer")?.let(::plainShelf)
+        val lockup = node.o("lockupViewModel")
+        if (lockup != null) {
+            val videoId = lockup.s("contentId")
+                ?: lockup.o("rendererContext").o("commandContext").o("onTap").o("innertubeCommand").o("watchEndpoint").s("videoId")
+            if (videoId != null) {
+                val title = lockup.o("metadata").o("lockupMetadataViewModel").o("title").s("content")
+                    ?: lockup.o("metadata").o("lockupMetadataViewModel").o("title").runs()
+                val artist = lockup.o("metadata").o("lockupMetadataViewModel").o("metadata").runs()
+                val thumb = lockup.o("image").a("sources").best()
+                    ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+                return ShelfItem(
+                    title = if (title.isNotBlank()) title else "Video",
+                    subtitle = artist,
+                    thumbnailUrl = thumb,
+                    videoId = videoId,
+                    browseId = null,
+                    isVideo = true,
+                )
+            }
         }
+
+        val shortsLockup = node.o("shortsLockupViewModel")
+        if (shortsLockup != null) {
+            val videoId = shortsLockup.o("onTap").o("innertubeCommand").o("reelWatchEndpoint").s("videoId")
+                ?: shortsLockup.s("entityId")?.removePrefix("shorts-shelf-item-")
+            if (videoId != null) {
+                val title = shortsLockup.o("overlayMetadata").o("primaryText").s("content")
+                    ?: shortsLockup.s("accessibilityText")?.substringBefore(",")
+                    ?: "Short"
+                val thumb = shortsLockup.o("onTap").o("innertubeCommand").o("reelWatchEndpoint")
+                    .o("thumbnail").a("thumbnails").best()
+                    ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+                return ShelfItem(
+                    title = title,
+                    subtitle = "Shorts",
+                    thumbnailUrl = thumb,
+                    videoId = videoId,
+                    browseId = null,
+                    isVideo = true,
+                )
+            }
+        }
+
+        val reelItem = node.o("reelItemRenderer")
+        if (reelItem != null) {
+            val videoId = reelItem.s("videoId")
+                ?: reelItem.o("navigationEndpoint").o("reelWatchEndpoint").s("videoId")
+            if (videoId != null) {
+                val title = reelItem.o("headline").runs().takeIf { it.isNotBlank() }
+                    ?: reelItem.o("headline").s("simpleText")
+                    ?: "Short"
+                val thumb = reelItem.o("thumbnail").a("thumbnails").best()
+                    ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+                return ShelfItem(
+                    title = title,
+                    subtitle = "Shorts",
+                    thumbnailUrl = thumb,
+                    videoId = videoId,
+                    browseId = null,
+                    isVideo = true,
+                    isShort = true,
+                )
+            }
+        }
+
+        val videoRenderer = (if (node.containsKey("videoId")) node else null)
+            ?: node.o("videoRenderer")
+            ?: node.o("compactVideoRenderer")
+            ?: node.o("gridVideoRenderer")
+            ?: node.o("playlistVideoRenderer")
+            ?: node.o("richItemRenderer").o("content").o("videoRenderer")
+            ?: return null
+
+        val videoId = videoRenderer.s("videoId")
+            ?: videoRenderer.o("navigationEndpoint").o("watchEndpoint").s("videoId")
+            ?: return null
+        val title = videoRenderer.o("title").runs().takeIf { it.isNotBlank() }
+            ?: videoRenderer.o("title").s("simpleText")?.takeIf { it.isNotBlank() }
+            ?: videoRenderer.o("headline").runs().takeIf { it.isNotBlank() }
+            ?: videoRenderer.o("headline").s("simpleText")?.takeIf { it.isNotBlank() }
+            ?: ""
+        if (title.isBlank()) return null
+
+        val artist = videoRenderer.o("shortBylineText").runs().takeIf { it.isNotBlank() }
+            ?: videoRenderer.o("shortBylineText").s("simpleText")?.takeIf { it.isNotBlank() }
+            ?: videoRenderer.o("longBylineText").runs().takeIf { it.isNotBlank() }
+            ?: videoRenderer.o("ownerText").runs()
+
+        val thumb = videoRenderer.o("thumbnail").a("thumbnails").best()
+            ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+
+        val channelThumb = videoRenderer.o("channelThumbnailSupportedRenderers")
+            .o("channelThumbnailWithLinkRenderer").o("thumbnail").a("thumbnails").best()
+            ?: videoRenderer.o("channelThumbnail").a("thumbnails").best()
+
+        val channelBrowseId = videoRenderer.o("navigationEndpoint").o("browseEndpoint").s("browseId")
+            ?: videoRenderer.o("ownerText").runsEndpoint()
+            ?: videoRenderer.o("shortBylineText").runsEndpoint()
+
+        return ShelfItem(
+            title = title,
+            subtitle = artist,
+            thumbnailUrl = thumb,
+            videoId = videoId,
+            browseId = null,
+            isVideo = true,
+            channelThumbnailUrl = channelThumb,
+            channelId = channelBrowseId,
+        )
+    }
+
+    fun parseCommunityPost(node: JsonObject): CommunityPost? {
+        val renderer = node.o("backstagePostRenderer")
+            ?: node.o("sharedPostRenderer")
+            ?: node.o("postRenderer")
+            ?: (if (node.containsKey("postId")) node else null)
+            ?: return null
+        val postId = renderer.s("postId") ?: return null
+        val author = renderer.o("authorText").runs().ifBlank { renderer.o("authorText").s("simpleText").orEmpty() }
+        val avatar = renderer.o("authorThumbnail").a("thumbnails").best()
+        val published = renderer.o("publishedTimeText").runs()
+        val text = renderer.o("contentText").runs().ifBlank { renderer.o("contentText").s("simpleText").orEmpty() }
+        val image = renderer.o("backstageImageRenderer").o("image").a("thumbnails").best()
+            ?: renderer.o("image").a("thumbnails").best()
+        val pollChoices = mutableListOf<PollChoice>()
+        val pollRenderer = renderer.o("pollRenderer") ?: renderer.o("quizRenderer")
+        pollRenderer?.a("choices")?.forEach { choiceElement ->
+            val c = choiceElement as? JsonObject ?: return@forEach
+            val choiceText = c.o("text").runs().ifBlank { c.o("text").s("simpleText").orEmpty() }
+            val pct = c.o("votePercentage").runs().ifBlank { c.o("votePercentage").s("simpleText").orEmpty() }
+            if (choiceText.isNotBlank()) {
+                pollChoices.add(PollChoice(text = choiceText, votePercentage = pct))
+            }
+        }
+        val likeCount = renderer.o("voteCount").s("simpleText") ?: renderer.o("voteCount").runs()
+        return CommunityPost(
+            postId = postId,
+            author = author.ifBlank { "Creator" },
+            authorThumbnail = avatar,
+            publishedTime = published,
+            contentText = text,
+            imageUrl = image,
+            pollChoices = pollChoices,
+            likeCount = likeCount,
+        )
+    }
+
+    fun parseSubscriptions(response: JsonObject): List<HomeShelf> {
+        val items = mutableListOf<ShelfItem>()
+        fun walk(node: JsonElement) {
+            when (node) {
+                is JsonObject -> {
+                    parseVideoItem(node)?.let { items.add(it) }
+                    parseTwoRowItem(node.o("musicTwoRowItemRenderer"))?.let { items.add(it) }
+                    parseResponsiveListItem(node.o("musicResponsiveListItemRenderer"))?.let { song ->
+                        items.add(ShelfItem(song.title, song.artist, song.thumbnailUrl, song.videoId, null, isVideo = true))
+                    }
+                    node.values.forEach(::walk)
+                }
+                is JsonArray -> node.forEach(::walk)
+                else -> Unit
+            }
+        }
+        walk(response)
+        val distinct = items.distinctBy { it.videoId ?: it.browseId }
+        if (distinct.isEmpty()) return emptyList()
+        return listOf(
+            HomeShelf(
+                title = "Subscriptions",
+                items = distinct,
+                layout = ShelfLayout.VIDEO,
+            )
+        )
+    }
+
+    fun parseHome(response: JsonObject): List<HomeShelf> {
+        val videoItems = mutableListOf<ShelfItem>()
+        fun walk(node: JsonElement) {
+            when (node) {
+                is JsonObject -> {
+                    parseVideoItem(node)?.let { videoItems.add(it) }
+                    node.values.forEach(::walk)
+                }
+                is JsonArray -> node.forEach(::walk)
+                else -> Unit
+            }
+        }
+        walk(response)
+        val distinct = videoItems.distinctBy { it.videoId }
+        if (distinct.isNotEmpty()) {
+            return listOf(HomeShelf("Recommended Videos", distinct, layout = ShelfLayout.VIDEO))
+        }
+        return emptyList()
     }
 
     /**
@@ -277,6 +578,24 @@ object InnertubeParser {
             }
         }
         walk(root)
+        if (out.isEmpty()) {
+            val videoItems = mutableListOf<ShelfItem>()
+            fun walkVideos(node: JsonElement) {
+                when (node) {
+                    is JsonObject -> {
+                        parseVideoItem(node)?.let { videoItems.add(it) }
+                        node.values.forEach(::walkVideos)
+                    }
+                    is JsonArray -> node.forEach(::walkVideos)
+                    else -> Unit
+                }
+            }
+            walkVideos(root)
+            val distinct = videoItems.distinctBy { it.videoId }
+            if (distinct.isNotEmpty()) {
+                out.add(HomeShelf("More Videos", distinct, layout = ShelfLayout.VIDEO))
+            }
+        }
         return out
     }
 
@@ -286,7 +605,8 @@ object InnertubeParser {
         val strapline = header.o("strapline").runs()
         val contents = carousel.a("contents").orEmpty()
         val parsed = contents.mapNotNull { item ->
-            parseTwoRowItem(item.o("musicTwoRowItemRenderer"))
+            parseVideoItem(item as? JsonObject)
+                ?: parseTwoRowItem(item.o("musicTwoRowItemRenderer"))
                 ?: parseResponsiveListItem(item.o("musicResponsiveListItemRenderer"))
                     ?.let { song ->
                         ShelfItem(song.title, song.artist, song.thumbnailUrl, song.videoId, null, isVideo = song.isVideo)
@@ -531,6 +851,58 @@ object InnertubeParser {
                         parseMultiRowListItem(renderer as? JsonObject, show)
                             ?.let { out[it.videoId] = it }
                     }
+                    (node["videoRenderer"] as? JsonObject)?.let { renderer ->
+                        parseVideoItem(renderer)?.let { item ->
+                            item.videoId?.let { vid ->
+                                out[vid] = Song(
+                                    videoId = vid,
+                                    title = item.title,
+                                    artist = artistFromSubtitle(item.subtitle),
+                                    thumbnailUrl = item.thumbnailUrl,
+                                    isVideo = true,
+                                )
+                            }
+                        }
+                    }
+                    (node["compactVideoRenderer"] as? JsonObject)?.let { renderer ->
+                        parseVideoItem(renderer)?.let { item ->
+                            item.videoId?.let { vid ->
+                                out[vid] = Song(
+                                    videoId = vid,
+                                    title = item.title,
+                                    artist = artistFromSubtitle(item.subtitle),
+                                    thumbnailUrl = item.thumbnailUrl,
+                                    isVideo = true,
+                                )
+                            }
+                        }
+                    }
+                    (node["lockupViewModel"] as? JsonObject)?.let { renderer ->
+                        parseVideoItem(renderer)?.let { item ->
+                            item.videoId?.let { vid ->
+                                out[vid] = Song(
+                                    videoId = vid,
+                                    title = item.title,
+                                    artist = artistFromSubtitle(item.subtitle),
+                                    thumbnailUrl = item.thumbnailUrl,
+                                    isVideo = true,
+                                )
+                            }
+                        }
+                    }
+                    (node["gridVideoRenderer"] as? JsonObject)?.let { renderer ->
+                        parseVideoItem(renderer)?.let { item ->
+                            item.videoId?.let { vid ->
+                                out[vid] = Song(
+                                    videoId = vid,
+                                    title = item.title,
+                                    artist = artistFromSubtitle(item.subtitle),
+                                    thumbnailUrl = item.thumbnailUrl,
+                                    isVideo = true,
+                                )
+                            }
+                        }
+                    }
                     node.values.forEach(::walk)
                 }
                 is JsonArray -> node.forEach(::walk)
@@ -636,6 +1008,51 @@ object InnertubeParser {
                 item.browseId,
                 ShelfItem(item.title, item.subtitle, item.thumbnailUrl, null, item.browseId),
             )
+        }
+        // YouTube Web renderers for video history, playlists, liked videos, watch later
+        listOf("videoRenderer", "compactVideoRenderer", "gridVideoRenderer", "playlistVideoRenderer").forEach { key ->
+            collectRenderers(root, key).forEach { renderer ->
+                parseVideoItem(renderer)?.let { item ->
+                    item.videoId?.let { out.putIfAbsent("v:$it", item) }
+                }
+            }
+        }
+        listOf("playlistRenderer", "gridPlaylistRenderer").forEach { key ->
+            collectRenderers(root, key).forEach { renderer ->
+                val playlistId = renderer.s("playlistId")
+                val title = renderer.o("title")?.runs()?.takeIf { it.isNotBlank() }
+                    ?: renderer.o("title")?.s("simpleText")
+                if (playlistId != null && !title.isNullOrBlank()) {
+                    val browseId = if (playlistId.startsWith("VL")) playlistId else "VL$playlistId"
+                    val thumb = renderer.a("thumbnails").best()
+                        ?: renderer.o("thumbnail")?.a("thumbnails").best()
+                    val subtitle = renderer.o("shortBylineText")?.runs()?.takeIf { it.isNotBlank() } ?: "Playlist"
+                    out.putIfAbsent(
+                        "b:$browseId",
+                        ShelfItem(title, subtitle, thumb, videoId = null, browseId = browseId, isVideo = false),
+                    )
+                }
+            }
+        }
+        collectRenderers(root, "lockupViewModel").forEach { renderer ->
+            val contentId = renderer.s("contentId") ?: return@forEach
+            val metadata = renderer.o("metadata")?.o("lockupMetadataViewModel")
+            val title = metadata?.o("title")?.s("content") ?: ""
+            val subtitle = metadata?.o("metadata")?.o("contentMetadataViewModel")
+                ?.a("metadataRows")?.firstOrNull()?.a("parts")?.firstOrNull()?.s("text") ?: ""
+            val thumb = renderer.o("contentImage")?.o("collectionThumbnailViewModel")
+                ?.o("primaryThumbnail")?.o("thumbnailViewModel")?.o("image")?.a("sources").best()
+                ?: renderer.o("contentImage")?.o("thumbnailViewModel")?.o("image")?.a("sources").best()
+            val isVideo = !contentId.startsWith("VL") && !contentId.startsWith("PL")
+            val videoId = if (isVideo) contentId else null
+            val browseId = if (!isVideo) (if (contentId.startsWith("VL")) contentId else "VL$contentId") else null
+            if (title.isNotBlank()) {
+                val key = if (isVideo) "v:$contentId" else "b:$browseId"
+                out.putIfAbsent(
+                    key,
+                    ShelfItem(title, subtitle, thumb, videoId = videoId, browseId = browseId, isVideo = isVideo),
+                )
+            }
         }
         return LibraryItemPage(out.values.toList(), continuationToken(root))
     }
@@ -766,7 +1183,7 @@ object InnertubeParser {
             // art where a catalogue track has square album cover art. Not an
             // episode, whose art is a widescreen still too: it is listened to,
             // and a "video" is dropped from the All tab's results.
-            isVideo = !episode && (rowType == "video" || thumbnails.isNotSquare()),
+            isVideo = true,
             isExplicit = renderer.hasExplicitBadge(),
             // Extract the "Remove from history" feedback token from the row's menu, if present.
             feedbackToken = extractFeedbackToken(renderer),
@@ -1220,16 +1637,25 @@ object InnertubeParser {
      */
     fun parseAccount(response: JsonElement): Account? {
         val header = collectRenderers(response, "activeAccountHeaderRenderer").firstOrNull()
+            ?: collectRenderers(response, "googleAccountHeaderRenderer").firstOrNull()
+            ?: collectRenderers(response, "accountItemRenderer").firstOrNull()
+            ?: collectRenderers(response, "accountItem").firstOrNull()
             ?: return null
         val name = header.o("accountName").runs()
-        if (name.isBlank()) return null
+            .ifBlank { header.o("accountName").s("simpleText").orEmpty() }
+            .ifBlank { header.o("channelName").runs() }
+            .ifBlank { header.o("title").runs() }
         val email = header.o("email").runs()
             .ifBlank { header.o("email").s("simpleText").orEmpty() }
             .ifBlank { header.o("channelHandle").runs() }
+            .ifBlank { header.o("subtitle").runs() }
+        val photo = header.o("accountPhoto").a("thumbnails").best()
+            ?: header.o("thumbnail").a("thumbnails").best()
+        if (name.isBlank() && email.isBlank()) return null
         return Account(
-            name = name,
+            name = name.ifBlank { "YouTube User" },
             email = email,
-            thumbnailUrl = header.o("accountPhoto").a("thumbnails").best(),
+            thumbnailUrl = photo,
         )
     }
 
@@ -1331,7 +1757,86 @@ object InnertubeParser {
             val song = panelSong(replacements[foundId] ?: found) ?: return@forEach
             out[song.videoId] = song
         }
+
+        // Also parse YouTube Web watch queue recommendations
+        val webRelated = collectRenderers(root, "compactVideoRenderer") +
+            collectRenderers(root, "videoWithContextRenderer") +
+            collectRenderers(root, "videoRenderer")
+        webRelated.forEach { renderer ->
+            val vid = renderer.s("videoId")
+                ?: renderer.o("navigationEndpoint").o("watchEndpoint").s("videoId")
+                ?: return@forEach
+            val title = renderer.o("title").runs().ifBlank { renderer.o("title").s("simpleText").orEmpty() }
+            if (title.isBlank()) return@forEach
+            val artist = renderer.o("shortBylineText").runs()
+                .ifBlank { renderer.o("longBylineText").runs() }
+                .ifBlank { renderer.o("ownerText").runs() }
+            val thumb = renderer.o("thumbnail").a("thumbnails").best()
+                ?: "https://i.ytimg.com/vi/$vid/hqdefault.jpg"
+            val channelThumb = renderer.o("channelThumbnailSupportedRenderers")
+                .o("channelThumbnailWithLinkRenderer").o("thumbnail").a("thumbnails").best()
+                ?: renderer.o("channelThumbnail").a("thumbnails").best()
+            val channelBrowseId = renderer.o("navigationEndpoint").o("browseEndpoint").s("browseId")
+                ?: renderer.o("ownerText").runsEndpoint()
+                ?: renderer.o("shortBylineText").runsEndpoint()
+            if (!out.containsKey(vid)) {
+                out[vid] = Song(
+                    videoId = vid,
+                    title = title,
+                    artist = artist,
+                    thumbnailUrl = thumb,
+                    isVideo = true,
+                    channelThumbnailUrl = channelThumb,
+                    channelId = channelBrowseId,
+                )
+            }
+        }
+
+        // Modern YouTube Web lockupViewModel recommendations
+        collectRenderers(root, "lockupViewModel").forEach { vm ->
+            val vid = vm.o("rendererContext").o("commandContext").o("onTap").o("innertubeCommand").o("watchEndpoint").s("videoId")
+                ?: vm.findString("videoId")
+                ?: return@forEach
+            val lockupMeta = vm.o("metadata").o("lockupMetadataViewModel")
+            val title = lockupMeta.o("title").s("content")
+                ?: return@forEach
+            if (title.isBlank()) return@forEach
+            val channelBrowseId = lockupMeta.o("image").o("decoratedAvatarViewModel").o("rendererContext")
+                .o("commandContext").o("onTap").o("innertubeCommand").o("browseEndpoint").s("browseId")
+            val channelThumb = lockupMeta.o("image").o("decoratedAvatarViewModel").o("avatar").o("avatarViewModel")
+                .o("image").a("sources").best()
+            val artist = lockupMeta.o("metadata").o("contentMetadataViewModel").a("metadataRows")
+                ?.firstOrNull()?.a("metadataParts")?.firstOrNull()?.o("text")?.s("content").orEmpty()
+            val thumb = vm.o("contentImage").o("thumbnailViewModel").o("image").a("sources").best()
+                ?: "https://i.ytimg.com/vi/$vid/hqdefault.jpg"
+            if (!out.containsKey(vid)) {
+                out[vid] = Song(
+                    videoId = vid,
+                    title = title,
+                    artist = artist,
+                    thumbnailUrl = thumb,
+                    isVideo = true,
+                    channelThumbnailUrl = channelThumb,
+                    channelId = channelBrowseId,
+                )
+            }
+        }
         return out.values.toList()
+    }
+
+    /** Extracts channel owner info (avatar, title, browseId, subscriber count) from YouTube next response. */
+    fun parseWatchVideoOwner(root: JsonElement): ChannelOwnerInfo? {
+        val owner = collectRenderers(root, "videoOwnerRenderer").firstOrNull() ?: return null
+        val cid = owner.o("navigationEndpoint").o("browseEndpoint").s("browseId")
+        val title = owner.o("title").runs().ifBlank { owner.o("title").s("simpleText").orEmpty() }
+        val thumb = owner.o("thumbnail").a("thumbnails").best()
+        val subs = owner.o("subscriberCountText").s("simpleText") ?: owner.o("subscriberCountText").runs()
+        return ChannelOwnerInfo(
+            channelId = cid,
+            channelTitle = title.takeIf { it.isNotBlank() },
+            channelThumbnailUrl = thumb,
+            subscriberCount = subs.takeIf { it.isNotBlank() },
+        )
     }
 
     /** One row of a watch queue as a [Song], or null for a row with no id or title. */
@@ -1665,24 +2170,7 @@ object InnertubeParser {
         // playlist or artist; widescreen art on one of those means it's a
         // music-video upload rather than the catalogue track, which the
         // player can now show — same test as parseResponsiveListItem's.
-        val isVideo = resolvedBrowseId == null && videoId != null && (
-            thumbnails.isNotSquare() ||
-                renderer.s("aspectRatio")?.contains("16_9") == true
-            )
-        // An album/playlist billed as a video chart/compilation — "N videos"
-        // in the subtitle, or "video" in the card's own title (e.g. "Daily
-        // Top Music Videos") — is the same dead-end as in parseBrowseItem.
-        // A plain track card is exempt: a song can legitimately be titled
-        // "Video Games" without being a music-video upload.
-        if (resolvedBrowseId != null &&
-            !resolvedBrowseId.startsWith("VL") &&
-            !resolvedBrowseId.startsWith("PL") &&
-            !resolvedBrowseId.startsWith("MPRE") &&
-            !resolvedBrowseId.startsWith("UC") &&
-            (VIDEO_WORD.containsMatchIn(title) || VIDEO_WORD.containsMatchIn(subtitle))
-        ) {
-            return null
-        }
+        val isVideo = videoId != null
         return ShelfItem(
             title = title,
             subtitle = subtitle,
@@ -1837,3 +2325,6 @@ private fun JsonArray?.isNotSquare(): Boolean {
     if (width <= 0 || height <= 0) return false
     return width / height !in 0.85..1.15
 }
+
+private fun JsonObject?.runsEndpoint(): String? =
+    this?.a("runs")?.firstOrNull()?.let { (it as? JsonObject)?.o("navigationEndpoint")?.o("browseEndpoint")?.s("browseId") }

@@ -93,13 +93,12 @@ object StreamResolver {
             // deciding whether a track played at all.
             //
             // Answered with an empty-but-well-formed envelope rather than an
-            // error, so nothing downstream treats it as a failed fetch; NewPipe
-            // finds no related items, which is exactly as many as are wanted.
-            // It has to be this padded: the library rejects any JSON body under
-            // fifty characters outright with "JSON response is too short", so a
-            // bare `{}` fails the whole extraction rather than quietly
-            // returning nothing.
-            if (NEXT_ENDPOINT in request.url()) {
+            // error for stream extraction where `next` is only autoplay recommendations.
+            // Comment extraction, however, uses `next` with a `continuation` token
+            // and must NOT be blocked.
+            val bodyString = request.dataToSend()?.let { String(it, Charsets.UTF_8) }.orEmpty()
+            val isCommentRequest = "continuation" in bodyString
+            if (NEXT_ENDPOINT in request.url() && !isCommentRequest) {
                 return Response(200, "OK", emptyMap(), EMPTY_NEXT_RESPONSE, request.url())
             }
             val builder = okhttp3.Request.Builder()
@@ -177,6 +176,11 @@ object StreamResolver {
     }
 
     private val init by lazy { NewPipe.init(OkHttpDownloader()) }
+
+    fun ensureInitialized() {
+        @Suppress("UNUSED_VARIABLE")
+        val dummy = init
+    }
 
     /**
      * The extractor's own leash on [Http.client].

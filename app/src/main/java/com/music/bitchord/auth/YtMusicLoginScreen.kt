@@ -1,7 +1,9 @@
 package com.music.bitchord.auth
 
 import android.annotation.SuppressLint
+import android.os.Message
 import android.webkit.CookieManager
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.fillMaxSize
@@ -14,6 +16,8 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.webkit.WebSettingsCompat
+import androidx.webkit.WebViewFeature
 import com.music.bitchord.data.DebugLog as Log
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -21,12 +25,13 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 
+private const val YOUTUBE_ORIGIN = "https://www.youtube.com"
 private const val MUSIC_ORIGIN = "https://music.youtube.com"
 
 private const val LOGIN_URL =
     "https://accounts.google.com/ServiceLogin" +
-        "?ltmpl=music&service=youtube&prompt=select_account" +
-    "&continue=https%3A%2F%2Fmusic.youtube.com%2F"
+        "?service=youtube&passive=true" +
+        "&continue=https%3A%2F%2Fwww.youtube.com%2Fsignin%3Faction_handle_signin%3Dtrue"
 
 private const val TAG = "BitChord"
 
@@ -97,23 +102,60 @@ fun YtMusicLoginScreen(
                     clearHistory()
                     clearFormData()
                 }
-                settings.javaScriptEnabled = true
-                settings.domStorageEnabled = true
+
+                val cookieManager = CookieManager.getInstance()
+                cookieManager.setAcceptCookie(true)
+                cookieManager.setAcceptThirdPartyCookies(this, true)
+
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    setSupportMultipleWindows(true)
+                    javaScriptCanOpenWindowsAutomatically = true
+
+                    // Strip "; wv" and "Version/4.0" to present a standard mobile Chrome signature
+                    // matching the device's actual OS, ARM architecture, and touch capabilities.
+                    userAgentString = browserUserAgent(userAgentString)
+                }
+
+                // Disallow sending X-Requested-With header to any origin.
+                // Google explicitly inspects X-Requested-With to block embedded WebViews with 403 disallowed_useragent.
+                if (WebViewFeature.isFeatureSupported(WebViewFeature.REQUESTED_WITH_HEADER_ALLOW_LIST)) {
+                    WebSettingsCompat.setRequestedWithHeaderOriginAllowList(settings, emptySet())
+                }
+
+                webChromeClient = object : WebChromeClient() {
+                    override fun onCreateWindow(
+                        view: WebView?,
+                        isDialog: Boolean,
+                        isUserGesture: Boolean,
+                        resultMsg: Message?
+                    ): Boolean {
+                        val transport = resultMsg?.obj as? WebView.WebViewTransport
+                        if (transport != null) {
+                            transport.webView = view
+                            resultMsg.sendToTarget()
+                            return true
+                        }
+                        return super.onCreateWindow(view, isDialog, isUserGesture, resultMsg)
+                    }
+                }
+
                 configureWebView(this)
 
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        // Reaching the Music origin only enables confirmation.
-                        // A multi-channel login can still be waiting for the
-                        // listener to choose an identity on this very page.
-                        // Capturing automatically here is the race that used to
-                        // create a fake "Personal" profile and close too soon.
-                        currentOnPageReady(url?.startsWith(MUSIC_ORIGIN) == true)
+                        // Reaching YouTube enables confirmation once the sign-in redirect is complete.
+                        val isYt = url != null && url.contains("youtube.com") &&
+                            !url.contains("accounts.google.com") &&
+                            !url.contains("action_handle_signin")
+                        currentOnPageReady(isYt)
                     }
                 }
 
                 webView = this
-                loadUrl(if (mode == WebSessionMode.SIGN_IN) LOGIN_URL else "$MUSIC_ORIGIN/")
+                loadUrl(if (mode == WebSessionMode.SIGN_IN) LOGIN_URL else "https://www.youtube.com/channel_switcher")
             }
         },
     )
@@ -121,48 +163,30 @@ fun YtMusicLoginScreen(
 
 /**
  * Takes the session from [view], if it is holding one.
- *
- * @return whether there was one to take. False means the cookie jar has no
- *   signing secret in it yet — the page is mid-login, or is not a YouTube page
- *   at all — and the caller should leave the screen open rather than saving
- *   something that cannot sign a request. See [AuthStore.hasApiSid].
  */
 private fun captureFrom(
     view: WebView,
     onCaptured: (CapturedSession) -> Unit,
     onUnavailable: () -> Unit,
 ) {
-    val cookies = CookieManager.getInstance().getCookie(MUSIC_ORIGIN)
-    if (cookies == null || !AuthStore.hasApiSid(cookies)) {
+    val cleanCookie = BrowserSession.cleanYouTubeCookies()
+    if (cleanCookie == null) {
+        Log.w(TAG, "capture failed: YouTube cookie jar does not contain auth tokens")
         onUnavailable()
         return
     }
-    // Flushed here rather than left to the WebView's own schedule: the screen
-    // is usually closing in the next frame, and a cookie jar written after
-    // that is a jar the next sign-in reads instead of this one.
-    CookieManager.getInstance().flush()
 
     view.evaluateJavascript(YTCFG_PROBE) { raw ->
         val config = raw.parseConfig()
-        val loggedIn = config?.get("loggedIn").let {
-            it is JsonPrimitive && it.content == "true"
-        }
-        if (config == null || !loggedIn) {
-            Log.w(TAG, "confirmation requested before the page exposed a signed-in identity")
-            onUnavailable()
-            return@evaluateJavascript
-        }
-        val pageId = config.string("pageId")
+        val pageId = config?.string("pageId")
         onCaptured(
             CapturedSession(
-                cookie = cookies,
-                // A delegated identity is the most specific answer the live
-                // page can give. Otherwise normalise its DATASYNC_ID.
-                dataSyncId = pageId ?: normalizeDataSyncId(config.string("dataSyncId")),
+                cookie = cleanCookie,
+                dataSyncId = pageId ?: normalizeDataSyncId(config?.string("dataSyncId")),
                 pageId = pageId,
-                authUser = config.string("authUser"),
-                visitorData = config.string("visitorData"),
-                clientVersion = config.string("clientVersion"),
+                authUser = config?.string("authUser"),
+                visitorData = config?.string("visitorData"),
+                clientVersion = config?.string("clientVersion"),
                 loggedIn = true,
             ),
         )

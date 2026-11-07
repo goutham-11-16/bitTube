@@ -21,6 +21,14 @@ data class ArtistRef(
     val browseId: String? = null,
 )
 
+/** Channel owner information for video watch screens. */
+data class ChannelOwnerInfo(
+    val channelId: String? = null,
+    val channelTitle: String? = null,
+    val channelThumbnailUrl: String? = null,
+    val subscriberCount: String? = null,
+)
+
 /** A playable YouTube Music track. */
 data class Song(
     val videoId: String,
@@ -46,6 +54,8 @@ data class Song(
     val albumId: String? = null,
     /** Names the album page header, which [albumId] alone can't. */
     val albumName: String? = null,
+    val channelThumbnailUrl: String? = null,
+    val channelId: String? = artistId,
     /** A music-video upload rather than the catalogue track. */
     val isVideo: Boolean = false,
     /**
@@ -389,13 +399,13 @@ sealed interface SearchResult {
 }
 
 enum class SearchFilter(val label: String, val params: String?) {
-    /** YouTube Music's mixed search page: songs, artists, albums and playlists. */
     ALL("All", null),
-    SONGS("Songs", "EgWKAQIIAWoKEAkQChAFEAMQBA=="),
-    VIDEOS("Videos", "EgWKAQIQAWoKEAkQChAFEAMQBA=="),
-    ALBUMS("Albums", "EgWKAQIYAWoKEAkQChAFEAMQBA=="),
-    ARTISTS("Artists", "EgWKAQIgAWoKEAkQChAFEAMQBA=="),
-    PLAYLISTS("Playlists", "EgWKAQIoAWoKEAkQChAFEAMQBA=="),
+    VIDEOS("Videos", "EgIQAQ%3D%3D"),
+    CHANNELS("Channels", "EgIQAg%3D%3D"),
+    PLAYLISTS("Playlists", "EgIQAw%3D%3D"),
+    SONGS("Videos", "EgIQAQ%3D%3D"),
+    ALBUMS("Playlists", "EgIQAw%3D%3D"),
+    ARTISTS("Channels", "EgIQAg%3D%3D"),
 }
 
 /** A card in a home-feed carousel: either a track (videoId) or an album/playlist (browseId). */
@@ -410,6 +420,9 @@ data class ShelfItem(
      * picture the player can show. Drawn as a 16:9 card, as the web player does.
      */
     val isVideo: Boolean = false,
+    val isShort: Boolean = false,
+    val channelThumbnailUrl: String? = null,
+    val channelId: String? = null,
 )
 
 /** How a shelf's items are laid out — the web player's `ShelfLayout`, by the same rules. */
@@ -422,7 +435,28 @@ enum class ShelfLayout {
 
     /** Widescreen cards for music videos. */
     VIDEO,
+
+    /** Vertical 9:16 cards for YouTube Shorts. */
+    SHORTS,
 }
+
+data class PollChoice(
+    val text: String,
+    val votePercentage: String? = null,
+    val isSelected: Boolean = false,
+)
+
+data class CommunityPost(
+    val postId: String,
+    val author: String,
+    val authorThumbnail: String?,
+    val publishedTime: String,
+    val contentText: String,
+    val imageUrl: String? = null,
+    val pollChoices: List<PollChoice> = emptyList(),
+    val likeCount: String? = null,
+    val commentCount: String? = null,
+)
 
 /** The signed-in Google account, as YouTube Music reports it. */
 data class Account(
@@ -478,10 +512,10 @@ data class HomeShelf(
  */
 fun shelfLayoutFor(title: String, items: List<ShelfItem>, fromList: Boolean): ShelfLayout {
     if (items.isEmpty()) return ShelfLayout.CARDS
-    val first = items.first()
-    if (fromList && first.videoId != null) return ShelfLayout.LIST
-    if (title.trim().equals("Listen again", ignoreCase = true)) return ShelfLayout.LIST
-    if (items.count { it.isVideo } * 2 > items.size) return ShelfLayout.VIDEO
+    if (title.contains("Shorts", ignoreCase = true) || items.any { it.isShort || it.subtitle.equals("Shorts", ignoreCase = true) }) {
+        return ShelfLayout.SHORTS
+    }
+    if (items.any { it.videoId != null }) return ShelfLayout.VIDEO
     return ShelfLayout.CARDS
 }
 

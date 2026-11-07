@@ -111,13 +111,13 @@ enum class DownloadQuality(
     /** Whether a source's bit-exact file is worth keeping, or a transcode will do. */
     val keepsLossless: Boolean,
 ) {
-    STANDARD(128, "Standard", "~128 kbps Opus · fits more on the device", "~4 MB", false),
-    HIGH(Int.MAX_VALUE, "High", "Best audio on offer; source quality first", "~8 MB", false),
+    STANDARD(128, "480p · SD", "480p video · ~128 kbps audio", "~35 MB", false),
+    HIGH(Int.MAX_VALUE, "720p / 1080p · HD", "1080p/720p video · Best audio", "~90 MB", false),
     LOSSLESS(
         Int.MAX_VALUE,
-        "Lossless",
-        "Bit-exact if a source has it, best Opus if not",
-        "~35 MB",
+        "4K / 1440p · Ultra HD",
+        "4K / 1440p video where available · Bit-exact audio",
+        "~250 MB",
         true,
     ),
 }
@@ -233,7 +233,7 @@ object AppSettings {
      * refusing with a sentence naming the switch that would allow it — only the
      * second is recoverable by the person it happens to.
      */
-    val wifiOnlyDownloads = MutableStateFlow(true)
+    val wifiOnlyDownloads = MutableStateFlow(false)
 
     /**
      * Keep ordinary downloads in Music/BitChord where other music apps can see
@@ -917,7 +917,7 @@ object AppSettings {
         ).coerceIn(MIN_UPGRADE_LENGTH_SLACK_SECONDS, MAX_UPGRADE_LENGTH_SLACK_SECONDS)
         migrateDownloadQuality()
         downloadQuality.value = readDownloadQuality()
-        wifiOnlyDownloads.value = prefs.getBoolean(KEY_WIFI_ONLY_DOWNLOADS, true)
+        wifiOnlyDownloads.value = prefs.getBoolean(KEY_WIFI_ONLY_DOWNLOADS, false)
         exportDownloads.value = prefs.getBoolean(KEY_EXPORT_DOWNLOADS, false)
         syncDownloadedPlaylists.value = prefs.getBoolean(KEY_SYNC_DOWNLOADED_PLAYLISTS, false)
         crossfadeSeconds.value = prefs.getInt(KEY_CROSSFADE, 0)

@@ -17,6 +17,7 @@ import coil3.svg.SvgDecoder
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import okhttp3.OkHttpClient
 import com.music.bitchord.auth.AuthStore
+import com.music.bitchord.auth.BrowserSession
 import com.music.bitchord.data.DebugLog
 import com.music.bitchord.data.lyrics.LyricsTranslation
 import androidx.appcompat.app.AppCompatDelegate
@@ -122,12 +123,17 @@ class BitChordApplication : Application(), SingletonImageLoader.Factory, Configu
         }
         // Migration-safe: an old single cookie becomes the first encrypted
         // session, while newer installs restore the profile the listener chose.
+        val cleanCookie = BrowserSession.cleanYouTubeCookies()
         val restoredSession = authStore.activeSession
+        val effectiveCookie = cleanCookie ?: restoredSession?.cookie
+        if (cleanCookie != null && restoredSession != null && cleanCookie != restoredSession.cookie) {
+            authStore.upsertSession(restoredSession.copy(cookie = cleanCookie))
+        }
         if (restoredSession != null && authStore.activeAccountId == null) {
             authStore.select(restoredSession.accountId, restoredSession.activeProfileId)
         }
-        authStore.cookie = restoredSession?.cookie
-        Innertube.cookie = restoredSession?.cookie
+        authStore.cookie = effectiveCookie
+        Innertube.cookie = effectiveCookie
         // Which account that cookie actually acts as. Read here rather than on
         // demand so the answer is usually in hand before the first request needs
         // it: a play registered under the wrong account is indistinguishable, to

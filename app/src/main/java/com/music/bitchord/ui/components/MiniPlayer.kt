@@ -11,18 +11,25 @@ import androidx.compose.animation.core.spring
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.drag
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.OpenInFull
+import androidx.compose.material.icons.rounded.SkipNext
+import androidx.compose.material.icons.rounded.SkipPrevious
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -35,10 +42,13 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerInputChange
@@ -344,18 +354,18 @@ internal fun Modifier.playerDockArt(dock: PlayerDock?, corner: Dp): Modifier {
 /** The mini player's cover for a music video: 16:9 at the cover's 40dp height. */
 private val VIDEO_ART_WIDTH = 71.dp
 
-/** Frosted mini player that rides just above the floating tab bar. */
-@OptIn(ExperimentalHazeMaterialsApi::class)
+/** Standalone 16:9 rectangular floating video miniplayer (YouTube PiP style) */
 @Composable
 fun MiniPlayer(
     song: Song,
     isPlaying: Boolean,
     isLoading: Boolean,
-    hazeState: HazeState,
+    hazeState: HazeState? = null,
     onPlayPause: () -> Unit,
     onNext: () -> Unit,
     onPrevious: () -> Unit,
     onExpand: () -> Unit,
+    onClose: (() -> Unit)? = null,
     /** @see com.music.bitchord.data.listentogether.ListenTogether.State.controlsLocked */
     controlsLocked: Boolean = false,
     onBlockedControl: () -> Unit = {},
@@ -363,148 +373,197 @@ fun MiniPlayer(
     dock: PlayerDock? = null,
     /** Dragging the bar up into the player. */
     pull: MiniPlayerPull? = null,
+    position: Long = 0L,
+    durationMs: Long = 0L,
     modifier: Modifier = Modifier,
 ) {
-    val reduceDynamicBlur by AppSettings.reduceDynamicBlur.collectAsStateWithLifecycle()
     val haptics = rememberHaptics()
-    // percent rather than a dp figure, so the corner stays exactly half the
-    // height if the row's contents ever change it — which is what keeps a pill
-    // a pill instead of a rounded rectangle. Same idiom as [FloatingBottomBar]
-    // directly below it, so the two shapes are the same family.
-    val shape = RoundedCornerShape(percent = 50)
+    // Exact 16:9 ratio floating video miniplayer (PiP style)
+    val shape = RoundedCornerShape(12.dp)
+    val videoAspectWidth = 200.dp
+    val videoAspectHeight = 112.5.dp
+
     Box(
         modifier = modifier
-            .padding(horizontal = BAR_GUTTER)
-            // Ahead of the surface, so a pull lifts the whole of it, frost and all.
-            .miniPlayerGestures(
-                pull = pull,
-                onNext = {
-                    haptics.play(Haptic.SkipNext)
-                    onNext()
-                },
-                onPrevious = {
-                    haptics.play(Haptic.SkipPrevious)
-                    onPrevious()
-                },
-                locked = controlsLocked,
-                onBlocked = onBlockedControl,
-            )
+            .size(width = videoAspectWidth, height = videoAspectHeight)
+            .shadow(elevation = 10.dp, shape = shape, spotColor = Color.Black.copy(alpha = 0.6f))
             .clip(shape)
-            .then(
-                if (reduceDynamicBlur) {
-                    Modifier.background(MaterialTheme.colorScheme.surface)
-                } else {
-                    Modifier.optimizedHazeEffect(
-                        state = hazeState,
-                        style = HazeMaterials.thin(MaterialTheme.colorScheme.surface),
-                    )
-                },
-            )
-            .border(0.5.dp, Color.White.copy(alpha = 0.10f), shape)
-            // Deliberately silent: the whole bar is the target, so it catches
-            // stray taps meant for the page behind it, and the sheet rising is
-            // its own confirmation. The glyphs on it still buzz.
+            .background(Color.Black)
+            .border(1.dp, Color.White.copy(alpha = 0.20f), shape)
             .clickable(onClick = onExpand),
     ) {
+        // 1. Fallback Artwork / Thumbnail
+        AsyncImage(
+            model = rememberRemoteArtworkUrl(song)?.artworkAt(ROW_ART_PX),
+            contentDescription = null,
+            contentScale = ContentScale.Crop,
+            modifier = Modifier.fillMaxSize(),
+        )
+
+        // 2. Video Surface playing the video
+        if (song.isVideo || song.videoId.isNotBlank()) {
+            AndroidMusicVideo(
+                videoId = song.videoId,
+                fit = false,
+                onRenderedChanged = {},
+                modifier = Modifier.fillMaxSize(),
+                priority = 0,
+            )
+        }
+
+        // 3. Dark Gradient Overlay for clear control visibility over video
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color(0x75000000),
+                            Color(0x2A000000),
+                            Color(0x75000000),
+                        ),
+                    ),
+                ),
+        )
+
+        // 4. Top Action Row: Expand (Left) & Close (Right)
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(
-                    horizontal = ROW_PADDING_HORIZONTAL,
-                    vertical = ROW_PADDING_VERTICAL,
-                ),
+                .padding(horizontal = 6.dp, vertical = 5.dp)
+                .align(Alignment.TopCenter),
+            horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            // A music video plays here at its own 16:9, as the web player's
-            // mini player does, rather than cropped into the square cover.
-            val artWidth by animateDpAsState(
-                targetValue = if (song.isVideo) VIDEO_ART_WIDTH else 40.dp,
-                label = "miniArtWidth",
-            )
-            Box(
+            // Expand to full player
+            IconButton(
+                onClick = {
+                    haptics.play(Haptic.Tap)
+                    onExpand()
+                },
                 modifier = Modifier
-                    .size(width = artWidth, height = 40.dp)
-                    .playerDockArt(dock, ART_CORNER)
-                    .clip(RoundedCornerShape(ART_CORNER))
-                    .thumbnailBorder(RoundedCornerShape(ART_CORNER))
-                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                    .size(28.dp)
+                    .background(Color(0x88000000), CircleShape),
             ) {
-                AsyncImage(
-                    model = rememberRemoteArtworkUrl(song)?.artworkAt(ROW_ART_PX),
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier.fillMaxSize(),
-                )
-                // A music video keeps playing in the cover's place, cropped to
-                // it, as the web player's mini player does — the full player,
-                // when it is up, takes the picture over.
-                if (song.isVideo) {
-                    AndroidMusicVideo(
-                        videoId = song.videoId,
-                        fit = false,
-                        onRenderedChanged = {},
-                        modifier = Modifier.fillMaxSize(),
-                        priority = 0,
-                    )
-                }
-            }
-            Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
-                // The badge in the artist line's colour and a long line faded
-                // out at its end, as on the glass bar's mini player.
-                ExplicitSongTitle(
-                    song = song,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    badgeColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                    fadeOverflow = true,
-                )
-                FadingLine(
-                    text = song.artist,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                Icon(
+                    imageVector = Icons.Rounded.OpenInFull,
+                    contentDescription = "Expand",
+                    tint = Color.White,
+                    modifier = Modifier.size(15.dp),
                 )
             }
-            if (isLoading) {
-                Box(Modifier.size(GLYPH_SLOT), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator(
-                        color = MaterialTheme.colorScheme.onBackground,
-                        strokeWidth = 2.dp,
-                        modifier = Modifier.size(SPINNER_SIZE),
-                    )
-                }
-            } else {
+
+            // Close miniplayer
+            if (onClose != null) {
                 IconButton(
                     onClick = {
-                        haptics.play(if (isPlaying) Haptic.Pause else Haptic.Resume)
-                        onPlayPause()
+                        haptics.play(Haptic.Tap)
+                        onClose()
                     },
-                    modifier = Modifier.size(GLYPH_SLOT),
+                    modifier = Modifier
+                        .size(28.dp)
+                        .background(Color(0x88000000), CircleShape),
                 ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Close,
+                        contentDescription = "Close",
+                        tint = Color.White,
+                        modifier = Modifier.size(16.dp),
+                    )
+                }
+            }
+        }
+
+        // 5. Center Playback Controls: Previous, Play/Pause/Spinner, Next
+        Row(
+            modifier = Modifier.align(Alignment.Center),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(
+                onClick = {
+                    haptics.play(Haptic.SkipPrevious)
+                    onPrevious()
+                },
+                enabled = !controlsLocked,
+                modifier = Modifier
+                    .size(30.dp)
+                    .background(Color(0x88000000), CircleShape),
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.SkipPrevious,
+                    contentDescription = "Previous",
+                    tint = Color.White.copy(alpha = if (controlsLocked) 0.35f else 1f),
+                    modifier = Modifier.size(18.dp),
+                )
+            }
+
+            Spacer(Modifier.width(10.dp))
+
+            IconButton(
+                onClick = {
+                    haptics.play(if (isPlaying) Haptic.Pause else Haptic.Resume)
+                    onPlayPause()
+                },
+                modifier = Modifier
+                    .size(40.dp)
+                    .background(Color(0xCC000000), CircleShape),
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(
+                        color = Color.White,
+                        strokeWidth = 2.dp,
+                        modifier = Modifier.size(22.dp),
+                    )
+                } else {
                     Icon(
                         imageVector = if (isPlaying) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
                         contentDescription = stringResource(if (isPlaying) R.string.pause else R.string.play),
-                        tint = MaterialTheme.colorScheme.onBackground,
-                        modifier = Modifier.size(GLYPH_SIZE),
+                        tint = Color.White,
+                        modifier = Modifier.size(24.dp),
                     )
                 }
             }
-            Spacer(Modifier.width(TRANSPORT_GAP))
-            // Faded and inert rather than removed while the host holds the
-            // controls, so the bar keeps its shape — see [controlsLocked].
+
+            Spacer(Modifier.width(10.dp))
+
             IconButton(
                 onClick = {
                     haptics.play(Haptic.SkipNext)
                     onNext()
                 },
                 enabled = !controlsLocked,
-                modifier = Modifier.size(GLYPH_SLOT),
+                modifier = Modifier
+                    .size(30.dp)
+                    .background(Color(0x88000000), CircleShape),
             ) {
-                MiniPlayerNextGlyph(
-                    tint = MaterialTheme.colorScheme.onBackground
-                        .copy(alpha = if (controlsLocked) 0.3f else 1f),
+                Icon(
+                    imageVector = Icons.Rounded.SkipNext,
+                    contentDescription = "Next",
+                    tint = Color.White.copy(alpha = if (controlsLocked) 0.35f else 1f),
+                    modifier = Modifier.size(18.dp),
                 )
             }
+        }
+
+        // 6. Bottom edge YouTube-Red progress line
+        val progressFraction = if (durationMs > 0) {
+            (position.toFloat() / durationMs.toFloat()).coerceIn(0f, 1f)
+        } else 0f
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(2.5.dp)
+                .align(Alignment.BottomCenter)
+                .background(Color(0x55FFFFFF)),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth(fraction = if (progressFraction > 0f) progressFraction else 0.04f)
+                    .height(2.5.dp)
+                    .background(Color(0xFFFF0000)),
+            )
         }
     }
 }

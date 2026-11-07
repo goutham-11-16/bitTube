@@ -66,6 +66,11 @@ interface PlayerHost {
     /** Holds the picture at [height] from now on, or lets it choose with null. Remembered. */
     fun setMusicVideoQuality(height: Int?) = Unit
 
+    val playbackSpeed: StateFlow<Float> get() = DefaultPlaybackSpeed
+    fun setPlaybackSpeed(speed: Float) = Unit
+
+    suspend fun fetchComments(videoId: String): List<CommentUi> = emptyList()
+
     /**
      * Artwork for [song], resolving covers that live inside a remote file
      * (WebDAV, SMB) where the platform can. Returns [Song.thumbnailUrl] otherwise.
@@ -158,6 +163,7 @@ interface PlayerHost {
 private val NoCast = MutableStateFlow(CastUi())
 
 private val DefaultVideoAspect = MutableStateFlow(16f / 9f)
+private val DefaultPlaybackSpeed = MutableStateFlow(1.0f)
 
 private val NoVideoQuality = MutableStateFlow(MusicVideoQualityUi())
 
@@ -181,9 +187,9 @@ internal fun videoQualityLabel(height: Int): String = when {
     else -> "${height}p"
 }
 
-/** Whether [song]'s picture can be shown here — a music video, on a platform that plays one. */
+/** Whether [song]'s picture can be shown here — any YouTube video on a platform that plays one. */
 internal fun showsMusicVideo(song: Song): Boolean =
-    song.isVideo && PlayerPlatform.host.musicVideoSupported
+    song.videoId.isNotEmpty() && PlayerPlatform.host.musicVideoSupported
 
 /** @see PlayerHost.MusicVideo */
 @Composable
@@ -478,3 +484,11 @@ internal fun rememberRemoteArtworkUrl(song: Song?): String? =
 @Composable
 internal fun AudioPipelineDialog(hazeState: HazeState, isPlaying: Boolean, onDismiss: () -> Unit) =
     PlayerPlatform.host.AudioPipelineDialog(hazeState, isPlaying, onDismiss)
+
+data class CommentUi(
+    val author: String,
+    val avatarUrl: String?,
+    val text: String,
+    val likeCount: String,
+    val timeAgo: String,
+)

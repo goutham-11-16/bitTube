@@ -34,6 +34,7 @@ import com.music.bitchord.ui.components.backdrop.backdrops.snapshotBackdropSourc
 import com.music.bitchord.ui.components.isGlassSupported
 import com.music.bitchord.ui.components.menuBackdropFrost
 import dev.chrisbanes.haze.HazeState
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -116,6 +117,108 @@ class AndroidPlayerHost(context: Context) : PlayerHost {
     override val musicVideoQuality: StateFlow<MusicVideoQualityUi> get() = MusicVideoEngine.quality
 
     override fun setMusicVideoQuality(height: Int?) = MusicVideoEngine.setQuality(height)
+
+    override val playbackSpeed: StateFlow<Float> get() = AppSettings.playbackSpeed
+
+    override fun setPlaybackSpeed(speed: Float) {
+        AppSettings.setPlaybackSpeed(speed)
+    }
+
+    override suspend fun fetchComments(videoId: String): List<CommentUi> = withContext(Dispatchers.IO) {
+        val newPipeResults = try {
+            com.music.bitchord.data.innertube.StreamResolver.ensureInitialized()
+            val service = org.schabi.newpipe.extractor.ServiceList.YouTube
+            val info = org.schabi.newpipe.extractor.comments.CommentsInfo
+                .getInfo(service, "https://www.youtube.com/watch?v=$videoId")
+            info.relatedItems.orEmpty().map { item ->
+                CommentUi(
+                    author = item.uploaderName.orEmpty(),
+                    avatarUrl = item.uploaderAvatars?.firstOrNull()?.url,
+                    text = item.commentText?.content.orEmpty(),
+                    likeCount = item.textualLikeCount.orEmpty(),
+                    timeAgo = item.textualUploadDate.orEmpty(),
+                )
+            }
+        } catch (e: Exception) {
+            com.music.bitchord.data.DebugLog.e("BitChord", "fetchComments NewPipe failed for $videoId", e)
+            emptyList()
+        }
+
+        if (newPipeResults.isNotEmpty()) return@withContext newPipeResults
+
+        // Fallback: Innertube next endpoint + continuation
+        try {
+            val response = com.music.bitchord.data.innertube.Innertube.next(videoId)
+            val fallback = mutableListOf<CommentUi>()
+            fun walk(node: kotlinx.serialization.json.JsonElement) {
+                when (node) {
+                    is kotlinx.serialization.json.JsonObject -> {
+                        val cr = node["commentRenderer"] as? kotlinx.serialization.json.JsonObject
+                        if (cr != null) {
+                            val author = (cr["authorText"] as? kotlinx.serialization.json.JsonObject)?.get("simpleText")?.let {
+                                (it as? kotlinx.serialization.json.JsonPrimitive)?.content
+                            } ?: ((cr["authorText"] as? kotlinx.serialization.json.JsonObject)?.get("runs") as? kotlinx.serialization.json.JsonArray)
+                                ?.firstOrNull()?.let { ((it as? kotlinx.serialization.json.JsonObject)?.get("text") as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty()
+
+                            val avatar = ((cr["authorThumbnail"] as? kotlinx.serialization.json.JsonObject)?.get("thumbnails") as? kotlinx.serialization.json.JsonArray)
+                                ?.lastOrNull()?.let { ((it as? kotlinx.serialization.json.JsonObject)?.get("url") as? kotlinx.serialization.json.JsonPrimitive)?.content }
+
+                            val text = ((cr["contentText"] as? kotlinx.serialization.json.JsonObject)?.get("runs") as? kotlinx.serialization.json.JsonArray)
+                                ?.joinToString("") {
+                                    ((it as? kotlinx.serialization.json.JsonObject)?.get("text") as? kotlinx.serialization.json.JsonPrimitive)?.content.orEmpty()
+                                } ?: (cr["contentText"] as? kotlinx.serialization.json.JsonObject)?.get("simpleText")?.let {
+                                    (it as? kotlinx.serialization.json.JsonPrimitive)?.content
+                                }.orEmpty()
+
+                            val likeCount = (cr["voteCount"] as? kotlinx.serialization.json.JsonObject)?.get("simpleText")?.let {
+                                (it as? kotlinx.serialization.json.JsonPrimitive)?.content
+                            }.orEmpty()
+
+                            val timeAgo = ((cr["publishedTimeText"] as? kotlinx.serialization.json.JsonObject)?.get("runs") as? kotlinx.serialization.json.JsonArray)
+                                ?.firstOrNull()?.let { ((it as? kotlinx.serialization.json.JsonObject)?.get("text") as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty()
+
+                            if (text.isNotBlank()) {
+                                fallback.add(CommentUi(author, avatar, text, likeCount, timeAgo))
+                            }
+                        }
+                        node.values.forEach(::walk)
+                    }
+                    is kotlinx.serialization.json.JsonArray -> node.forEach(::walk)
+                    else -> Unit
+                }
+            }
+            walk(response)
+
+            if (fallback.isEmpty()) {
+                var commentsToken: String? = null
+                fun findToken(node: kotlinx.serialization.json.JsonElement) {
+                    if (commentsToken != null) return
+                    if (node is kotlinx.serialization.json.JsonObject) {
+                        val cr = node["continuationItemRenderer"] as? kotlinx.serialization.json.JsonObject
+                        val cmd = (cr?.get("continuationEndpoint") as? kotlinx.serialization.json.JsonObject)
+                            ?.get("continuationCommand") as? kotlinx.serialization.json.JsonObject
+                        val t = (cmd?.get("token") as? kotlinx.serialization.json.JsonPrimitive)?.content
+                        if (t != null) {
+                            commentsToken = t
+                            return
+                        }
+                        node.values.forEach(::findToken)
+                    } else if (node is kotlinx.serialization.json.JsonArray) {
+                        node.forEach(::findToken)
+                    }
+                }
+                findToken(response)
+                if (commentsToken != null) {
+                    val contResponse = com.music.bitchord.data.innertube.Innertube.browseContinuation(commentsToken!!)
+                    walk(contResponse)
+                }
+            }
+            fallback
+        } catch (e: Exception) {
+            com.music.bitchord.data.DebugLog.e("BitChord", "fetchComments Innertube failed for $videoId", e)
+            emptyList()
+        }
+    }
 
     @Composable
     override fun rememberRemoteArtworkUrl(song: Song?): String? =

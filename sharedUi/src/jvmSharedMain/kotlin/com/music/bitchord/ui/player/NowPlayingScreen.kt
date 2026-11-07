@@ -765,6 +765,8 @@ fun NowPlayingScreen(
      * the sheet is the caller's business.
      */
     onListenTogether: () -> Unit,
+    onPlayRecommended: ((Song) -> Unit)? = null,
+    onDownload: ((Song) -> Unit)? = null,
     lyrics: List<LyricLine>?,
     lyricsSource: LyricsSource?,
     lyricsProviderStates: Map<LyricsSource, LyricsProviderState>,
@@ -794,6 +796,9 @@ fun NowPlayingScreen(
      * rather than a still of it.
      */
     onLiveCanvasChanged: (Boolean) -> Unit = {},
+    onDismiss: (() -> Unit)? = null,
+    onEnterPip: (() -> Unit)? = null,
+    inPip: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val density = LocalDensity.current
@@ -830,6 +835,10 @@ fun NowPlayingScreen(
     var showCast by remember { mutableStateOf(false) }
     var showAudioOutput by remember { mutableStateOf(false) }
     var showVideoQuality by remember { mutableStateOf(false) }
+    var showPlaybackSpeed by remember { mutableStateOf(false) }
+    var captionsEnabled by remember { mutableStateOf(false) }
+    var videoFit by remember { mutableStateOf(true) }
+    val playbackSpeed by PlayerPlatform.host.playbackSpeed.collectAsStateWithLifecycle()
     var showLyricsProviders by remember { mutableStateOf(false) }
     // Gated on the Bluetooth permission the first time — see [rememberOutputPicker].
     val openAudioOutput = rememberOutputPicker { showAudioOutput = true }
@@ -1038,7 +1047,7 @@ fun NowPlayingScreen(
     val overlayOpen = remember {
         derivedStateOf {
             currentMenuOpen() || showAudioPipeline || showCast || showAudioOutput || showVideoQuality ||
-                showLyricsProviders || showListenTogetherMembers || lyricsShare != null || currentLyricsOffsetOpen
+                showPlaybackSpeed || showLyricsProviders || showListenTogetherMembers || lyricsShare != null || currentLyricsOffsetOpen
         }
     }
     val lyricsShareEnabled = lyricsShareAvailable
@@ -1101,6 +1110,8 @@ fun NowPlayingScreen(
     PlayerBackHandler(enabled = showAudioOutput) { showAudioOutput = false }
 
     PlayerBackHandler(enabled = showVideoQuality) { showVideoQuality = false }
+
+    PlayerBackHandler(enabled = showPlaybackSpeed) { showPlaybackSpeed = false }
 
     PlayerBackHandler(enabled = showLyricsProviders) { showLyricsProviders = false }
 
@@ -1606,6 +1617,14 @@ fun NowPlayingScreen(
                 onDismiss = { showVideoQuality = false },
             )
         }
+        if (showPlaybackSpeed) {
+            PlaybackSpeedSheet(
+                currentSpeed = playbackSpeed,
+                hazeState = playerHaze,
+                onSelectSpeed = { PlayerPlatform.host.setPlaybackSpeed(it) },
+                onDismiss = { showPlaybackSpeed = false },
+            )
+        }
         if (showAudioOutput) {
             AudioOutputSheet(
                 hazeState = playerHaze,
@@ -1918,18 +1937,10 @@ fun NowPlayingScreen(
                             )
                         }
                     },
-                    transport = {
-                        TransportRow(
-                            isPlaying = isPlaying,
-                            isLoading = isLoading || audioVersionSwitching,
-                            previousEnabled = !controlsLocked && (hasPrevious || pastRestartPoint),
-                            nextEnabled = !controlsLocked && hasNext,
-                            onPrevious = onPrevious,
-                            onPlayPause = onPlayPause,
-                            onNext = onNext,
-                            compact = true,
-                        )
-                    },
+                    transport = {},
+                    onPlayPause = onPlayPause,
+                    onSeekBack = { onSeek((position.positionMs - 10_000L).coerceAtLeast(0L)) },
+                    onSeekForward = { onSeek((position.positionMs + 10_000L).coerceAtMost(durationMs.coerceAtLeast(0L))) },
                 )
             }
         } else if (landscape) {
@@ -2250,6 +2261,60 @@ fun NowPlayingScreen(
                             modifier = Modifier.fillMaxSize(),
                         )
                     },
+                )
+            }
+        } else if (videoMode) {
+            val backDispatcher = androidx.activity.compose.LocalOnBackPressedDispatcherOwner.current?.onBackPressedDispatcher
+            val versionAligning by PlayerSettings.versionAlignmentInProgress.collectAsStateWithLifecycle()
+            val transitionWindow by PlayerSettings.smartTransitionWindow.collectAsStateWithLifecycle()
+            Box(modifier = Modifier.fillMaxSize().then(dockHost)) {
+                YouTubePortraitVideoLayout(
+                    song = song,
+                    isPlaying = isPlaying,
+                    isLoading = isLoading || audioVersionSwitching,
+                    onPlayPause = onPlayPause,
+                    onNext = onNext,
+                    onPrevious = onPrevious,
+                    onSeekBack = { onSeek((position.positionMs - 10_000L).coerceAtLeast(0L)) },
+                    onSeekForward = { onSeek((position.positionMs + 10_000L).coerceAtMost(durationMs.coerceAtLeast(0L))) },
+                    rendered = videoRendered,
+                    onRenderedChanged = { videoRendered = it },
+                    likeStatus = likeStatus,
+                    onToggleLike = onToggleLike,
+                    queue = queue,
+                    queueIndex = queueIndex,
+                    onSelectQueueItem = { selectedSong, index ->
+                        onJumpTo(index)
+                    },
+                    onPlayRecommended = onPlayRecommended,
+                    onOpenChannel = { id, name -> onOpenArtist(id, name) },
+                    onDownload = onDownload,
+                    onOpenQuality = { showVideoQuality = true },
+                    onOpenSpeed = { showPlaybackSpeed = true },
+                    playbackSpeed = playbackSpeed,
+                    captionsEnabled = captionsEnabled,
+                    onToggleCaptions = { captionsEnabled = !captionsEnabled },
+                    videoFit = videoFit,
+                    onToggleFit = { videoFit = !videoFit },
+                    onFullscreen = screenOrientation::landscape,
+                    onDismiss = { onDismiss?.invoke() ?: backDispatcher?.onBackPressed() },
+                    onEnterPip = onEnterPip,
+                    scrubber = {
+                        PlayerScrubber(
+                            shown = shown,
+                            durationMs = durationMs,
+                            loading = versionAligning || audioVersionSwitching,
+                            mixing = mixing && !scrub.scrubbing,
+                            transitionWindow = transitionWindow
+                                ?.takeIf { !scrub.scrubbing && it.end > it.start }
+                                ?.let { it.start..it.end },
+                            onScrub = onScrub,
+                            onScrubFinished = onScrubFinished,
+                        )
+                    },
+                    transport = {},
+                    hazeState = playerHaze,
+                    inPip = inPip,
                 )
             }
         } else {
@@ -3434,6 +3499,7 @@ fun NowPlayingScreen(
                                     }
                                     MusicVideoSurface(
                                         videoId = song.videoId,
+                                        fit = videoFit,
                                         onRenderedChanged = { videoRendered = it },
                                         modifier = Modifier
                                             .fillMaxSize()
@@ -3443,6 +3509,12 @@ fun NowPlayingScreen(
                                         fullscreen = false,
                                         onToggleFullscreen = screenOrientation::landscape,
                                         onOpenQuality = { showVideoQuality = true },
+                                        onOpenSpeed = { showPlaybackSpeed = true },
+                                        speedText = if (playbackSpeed == 1f) "1x" else "${playbackSpeed}x",
+                                        onToggleFit = { videoFit = !videoFit },
+                                        isFit = videoFit,
+                                        onToggleCaptions = { captionsEnabled = !captionsEnabled },
+                                        captionsEnabled = captionsEnabled,
                                         modifier = Modifier
                                             .align(Alignment.TopEnd)
                                             .padding(8.dp),

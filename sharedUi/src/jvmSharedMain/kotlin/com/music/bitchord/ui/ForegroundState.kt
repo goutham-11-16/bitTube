@@ -1,50 +1,48 @@
 package com.music.bitchord.ui
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 
+private fun Context.findActivity(): Activity? {
+    var ctx = this
+    while (ctx is ContextWrapper) {
+        if (ctx is Activity) return ctx
+        ctx = ctx.baseContext
+    }
+    return null
+}
+
 /**
  * Whether the app is actually on screen.
  *
- * The distinction this exists to draw is one Compose does not draw on its own:
- * a `LaunchedEffect` belongs to the *composition*, not to the lifecycle, and a
- * composition outlives the activity being stopped — it is torn down only when
- * the activity is destroyed. So every loop the UI starts goes on running with
- * the screen off: position polls, frame clocks, a video decoder feeding a
- * surface nobody is looking at.
- *
- * None of that work has a viewer, and none of it survives being skipped —
- * whatever it was keeping up to date is re-read the moment the screen comes
- * back. Gating on this is the difference between "cheap while visible" and
- * "cheap", and it costs nothing on screen.
- *
- * RESUMED rather than STARTED: a paused-but-visible activity is one behind a
- * dialog or in the background half of split screen, which is not a case worth
- * animating for either.
- *
- * Playback itself is not gated on this and must not be — audio comes from
- * [com.music.bitchord.playback.PlaybackService], which is a foreground service
- * precisely so that it goes on running when this does not.
+ * In full screen, RESUMED is required so loops pause when backgrounded.
+ * When in Android Picture-in-Picture (PiP) mode, the activity is in STARTED
+ * state rather than RESUMED (it is not the top focused activity), so STARTED
+ * is accepted during PiP to keep video decoding and rendering alive.
  */
 @Composable
 fun rememberIsForeground(): Boolean {
-    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val lifecycle = lifecycleOwner.lifecycle
+    fun isVisible(state: Lifecycle.State): Boolean = state.isAtLeast(Lifecycle.State.STARTED)
+
     var foreground by remember(lifecycle) {
-        mutableStateOf(lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+        mutableStateOf(isVisible(lifecycle.currentState))
     }
-    DisposableEffect(lifecycle) {
-        // Every event rather than ON_RESUME/ON_PAUSE alone: the state is read
-        // back off the lifecycle instead of inferred from which event arrived,
-        // so there is no transition this can be left out of step by.
+    DisposableEffect(lifecycle, lifecycleOwner) {
         val observer = LifecycleEventObserver { owner, _ ->
-            foreground = owner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+            foreground = isVisible(owner.lifecycle.currentState)
         }
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }

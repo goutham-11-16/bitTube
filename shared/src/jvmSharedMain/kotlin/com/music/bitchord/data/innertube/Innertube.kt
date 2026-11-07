@@ -88,6 +88,10 @@ object Innertube {
     private const val MUSIC_BASE = "https://music.youtube.com/youtubei/v1"
     private const val MUSIC_ORIGIN = "https://music.youtube.com"
     private const val YOUTUBE_ORIGIN = "https://www.youtube.com"
+    private const val YOUTUBE_BASE = "https://www.youtube.com/youtubei/v1"
+    private const val YOUTUBE_CLIENT_ID = "1"
+    private const val YOUTUBE_CLIENT_NAME = "WEB"
+    private const val YOUTUBE_CLIENT_VERSION = "2.20241105.00.00"
 
     /**
      * Fallback WEB_REMIX version, used until [SessionScope] reads the live one
@@ -412,11 +416,11 @@ object Innertube {
      * which is the same as not having asked.
      */
     private suspend fun fetchSessionScope(session: String): SessionScope? {
-        val html = client.get("$MUSIC_ORIGIN/") {
+        val html = client.get("$YOUTUBE_ORIGIN/") {
             header("User-Agent", WEB_USER_AGENT)
             header("Accept-Language", acceptLanguageHeader)
             header("Cookie", session)
-            sapisidFrom(session)?.let { header("Authorization", sapisidHash(it)) }
+            sapisidFrom(session)?.let { header("Authorization", sapisidHash(it, YOUTUBE_ORIGIN)) }
         }.bodyAsText()
 
         // The one value that must not be guessed. A shell that says it is
@@ -426,7 +430,7 @@ object Innertube {
         val signedIn = CONFIG_LOGGED_IN.find(html)?.groupValues?.get(1) == "true"
         val clientVersion = CONFIG_CLIENT_VERSION.find(html)?.groupValues?.get(1)
         if (!signedIn) {
-            Log.w(TAG, "music.youtube.com served a signed-out shell; not scoping requests")
+            Log.w(TAG, "youtube.com served a signed-out shell; not scoping requests")
             // Still worth the client version — that part is true either way.
             return clientVersion?.let { SessionScope(null, null, "0", it) }
         }
@@ -527,28 +531,24 @@ object Innertube {
     // ---- Public API ---------------------------------------------------------
 
     suspend fun browse(browseId: String, params: String? = null): JsonObject =
-        postMusic("browse") {
+        postYouTube("browse") {
             put("browseId", browseId)
             params?.let { put("params", it) }
         }
 
     /**
      * The next page of a paged browse response — playlists and library feeds
-     * come back roughly 100 rows at a time. YouTube Music takes the token as
-     * query parameters rather than in the body, and answers with a bare
-     * continuation envelope carrying the same row renderers.
+     * come back roughly 100 rows at a time.
      */
-    suspend fun browseContinuation(token: String): JsonObject = postMusic(
+    suspend fun browseContinuation(token: String): JsonObject = postYouTube(
         endpoint = "browse",
-        // The web client passes the token in the body and the older query-string
-        // form is still honoured; both are sent so either is enough.
         query = mapOf("ctoken" to token, "continuation" to token, "type" to "next"),
     ) {
         put("continuation", token)
     }
 
     /** Signed-in profile: display name, email/handle and avatar. */
-    suspend fun accountMenu(): JsonObject = postMusic("account/account_menu") {}
+    suspend fun accountMenu(): JsonObject = postYouTube("account/account_menu") {}
 
     /**
      * Every channel this session can act as, as Innertube's account switcher
@@ -558,7 +558,7 @@ object Innertube {
      * channel — a `pageIdToken` and a `datasyncIdToken` — which is the whole
      * reason to ask rather than to reason about it. See [selectChannel].
      */
-    suspend fun accountsList(): JsonObject = postMusic("account/accounts_list") {}
+    suspend fun accountsList(): JsonObject = postYouTube("account/accounts_list") {}
 
     /**
      * The same list from youtube.com's own switcher, as a second route.
@@ -597,26 +597,20 @@ object Innertube {
     }
 
     /**
-     * The watch queue that YouTube Music would play after [videoId] — the
-     * "RDAMVM" radio mix. Used to keep AutoPlay going past the last track.
+     * The watch queue or related videos after [videoId].
      */
-    suspend fun next(videoId: String): JsonObject = postMusic("next") {
+    suspend fun next(videoId: String): JsonObject = postYouTube("next") {
         put("videoId", videoId)
-        put("playlistId", "RDAMVM$videoId")
-        put("isAudioOnly", true)
     }
 
     /**
-     * A watch queue started from a playlist rather than a track: a mix such as
-     * My Supermix, a playlist radio (`RDAMPL…`), or an artist's Mix / Shuffle
-     * button, which also carry their own seed [videoId] and [params].
+     * A watch queue started from a playlist.
      */
     suspend fun nextPlaylist(playlistId: String, videoId: String? = null, params: String? = null): JsonObject =
-        postMusic("next") {
+        postYouTube("next") {
             videoId?.let { put("videoId", it) }
             put("playlistId", playlistId)
             params?.let { put("params", it) }
-            put("isAudioOnly", true)
         }
 
     /** Timed caption transcript used as a last-resort lyrics source. */
@@ -627,20 +621,13 @@ object Innertube {
     }
 
     suspend fun search(query: String, params: String? = null, anonymous: Boolean = true): JsonObject =
-        if (anonymous) {
-            postMusicAnonymous("search", region = searchRegion) {
-                put("query", query)
-                params?.let { put("params", it) }
-            }
-        } else {
-            postMusic("search", region = searchRegion) {
-                put("query", query)
-                params?.let { put("params", it) }
-            }
+        postYouTube("search", region = searchRegion, anonymous = anonymous) {
+            put("query", query)
+            params?.let { put("params", it) }
         }
 
     /** The next page of a filtered search result. */
-    suspend fun searchContinuation(token: String): JsonObject = postMusic(
+    suspend fun searchContinuation(token: String): JsonObject = postYouTube(
         endpoint = "search",
         query = mapOf("ctoken" to token, "continuation" to token, "type" to "next"),
         region = searchRegion,
@@ -674,7 +661,7 @@ object Innertube {
      * land as anonymous lookups that don't touch the user's account history.
      */
     suspend fun searchTypeahead(query: String): JsonObject =
-        postMusicAnonymous("search", region = searchRegion) {
+        postYouTube("search", region = searchRegion, anonymous = true) {
             put("query", query)
         }
 
@@ -1111,6 +1098,68 @@ object Innertube {
         "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
 
     // ---- Request plumbing ---------------------------------------------------
+
+    suspend fun postYouTube(
+        endpoint: String,
+        query: Map<String, String> = emptyMap(),
+        region: String? = currentRegion,
+        anonymous: Boolean = false,
+        bodyExtras: JsonObjectBuilder.() -> Unit = {},
+    ): JsonObject {
+        if (cookie != null) ensureSessionScope()
+        val session = scope
+        val response = withRetry {
+            client.post("$YOUTUBE_BASE/$endpoint") {
+                contentType(ContentType.Application.Json)
+                parameter("prettyPrint", "false")
+                parameter("hl", currentLanguage)
+                header("Accept-Language", acceptLanguageHeader)
+                query.forEach { (key, value) -> parameter(key, value) }
+                header("X-Origin", YOUTUBE_ORIGIN)
+                header("Origin", YOUTUBE_ORIGIN)
+                header("Referer", "$YOUTUBE_ORIGIN/")
+                header("X-YouTube-Client-Name", YOUTUBE_CLIENT_ID)
+                header("X-YouTube-Client-Version", YOUTUBE_CLIENT_VERSION)
+                visitorData?.let { header("X-Goog-Visitor-Id", it) }
+                if (!anonymous) {
+                    cookie?.let { c ->
+                        header("Cookie", c)
+                        header("X-Goog-AuthUser", authUserFor(session))
+                        pageIdFor(session)?.let { header("X-Goog-PageId", it) }
+                        sapisidFrom(c)?.let { header("Authorization", sapisidHash(it, origin = YOUTUBE_ORIGIN)) }
+                    }
+                }
+                setBody(
+                    buildJsonObject {
+                        putJsonObject("context") {
+                            putJsonObject("client") {
+                                put("clientName", YOUTUBE_CLIENT_NAME)
+                                put("clientVersion", YOUTUBE_CLIENT_VERSION)
+                                put("hl", currentLanguage)
+                                region?.let { put("gl", it) }
+                                visitorData?.let { put("visitorData", it) }
+                                put("originalUrl", YOUTUBE_ORIGIN)
+                                put("platform", "DESKTOP")
+                            }
+                            putJsonObject("user") {
+                                put("lockedSafetyMode", false)
+                                if (!anonymous) {
+                                    dataSyncIdFor(session)?.let { put("onBehalfOfUser", it) }
+                                }
+                            }
+                            putJsonObject("request") { put("useSsl", true) }
+                        }
+                        bodyExtras()
+                    },
+                )
+            }.body<JsonObject>()
+        }
+        if (visitorData == null) {
+            visitorData = response["responseContext"]?.jsonObject
+                ?.get("visitorData")?.jsonPrimitive?.content
+        }
+        return response
+    }
 
     private suspend fun postMusic(
         endpoint: String,

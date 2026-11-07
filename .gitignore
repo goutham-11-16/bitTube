@@ -50,3 +50,7 @@ AGENTS.md
 
 # Claude Code session files (launch configs, worktrees)
 .claude/
+
+# Native downloaded archives
+native/third_party/*.tar.*
+native/third_party/*.zip

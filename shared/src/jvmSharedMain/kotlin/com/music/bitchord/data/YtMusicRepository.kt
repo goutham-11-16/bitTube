@@ -5,6 +5,7 @@ import com.music.bitchord.data.innertube.Innertube
 import com.music.bitchord.data.innertube.InnertubeParser
 import com.music.bitchord.data.model.Account
 import com.music.bitchord.data.model.AccountChannel
+import com.music.bitchord.data.model.ChannelOwnerInfo
 import com.music.bitchord.data.model.isExactArtistMatch
 import com.music.bitchord.data.model.normalizedArtistName
 import com.music.bitchord.data.model.ArtistPage
@@ -20,6 +21,7 @@ import com.music.bitchord.data.model.PlaylistPrivacy
 import com.music.bitchord.data.model.SearchFilter
 import com.music.bitchord.data.model.SearchResult
 import com.music.bitchord.data.model.ShelfItem
+import com.music.bitchord.data.model.ShelfLayout
 import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.model.SongMenu
 import com.music.bitchord.data.model.UserPlaylist
@@ -76,8 +78,32 @@ object YtMusicRepository {
      * it's empty and there's nothing more to fetch.
      */
     suspend fun home(): Result<HomeFeed> = call("home") {
-        val home = Innertube.browse("FEmusic_home")
-        HomeFeed(InnertubeParser.parseHome(home), InnertubeParser.continuationToken(home))
+        val home = runCatching { Innertube.browse("FEwhat_to_watch") }.getOrNull()
+        val parsedShelves = home?.let(InnertubeParser::parseHome).orEmpty()
+        val shelves = if (parsedShelves.isNotEmpty()) {
+            parsedShelves
+        } else {
+            val trendingVideos = runCatching {
+                InnertubeParser.parseSearchVideos(Innertube.search("trending videos", anonymous = true))
+            }.getOrDefault(emptyList())
+            if (trendingVideos.isNotEmpty()) {
+                listOf(
+                    HomeShelf(
+                        title = "Trending Videos",
+                        items = trendingVideos,
+                        layout = ShelfLayout.VIDEO,
+                    )
+                )
+            } else emptyList()
+        }
+        HomeFeed(shelves, home?.let(InnertubeParser::continuationToken))
+    }
+
+    /** The Subscriptions feed (FEsubscriptions). */
+    suspend fun subscriptions(): Result<List<HomeShelf>> = call("subscriptions") {
+        val resp = runCatching { Innertube.browse("FEsubscriptions") }.getOrNull()
+        val parsed = resp?.let(InnertubeParser::parseSubscriptions).orEmpty()
+        parsed
     }
 
     /** Recently played is rendered independently, at the top of the Play page. */
@@ -88,10 +114,7 @@ object YtMusicRepository {
         shelvesOf(browseId)
     }
 
-    val HOME_SUPPLEMENT_BROWSE_IDS = listOf(
-        "FEmusic_new_releases",
-        "FEmusic_explore",
-    )
+    val HOME_SUPPLEMENT_BROWSE_IDS = emptyList<String>()
 
     /**
      * More Home shelves past [home]'s first page, following FEmusic_home's
@@ -285,7 +308,7 @@ object YtMusicRepository {
         allHomeTrackSongs.ifEmpty { exploreSongs }
     }
 
-    private const val HISTORY = "FEmusic_history"
+    private const val HISTORY = "FEhistory"
     private const val RECENT_TITLE = "Recents"
 
     /** Enough to scroll through, short of turning the shelf into the history page. */
@@ -639,6 +662,12 @@ object YtMusicRepository {
             InnertubeParser.parseWatchQueue(Innertube.next(videoId), preferVideo = preferVideo)
         }
 
+    /** Extracts channel owner info (avatar, channelId, title, subscribers) for a video. */
+    suspend fun videoOwner(videoId: String): Result<ChannelOwnerInfo?> =
+        call("videoOwner:$videoId") {
+            InnertubeParser.parseWatchVideoOwner(Innertube.next(videoId))
+        }
+
     /**
      * The page of the artist called exactly [name], or null when there is none.
      *
@@ -934,7 +963,7 @@ object YtMusicRepository {
      * Public because it is also the page a track has to disappear from the
      * moment it stops being liked — see MainViewModel's `dropFromLikedLists`.
      */
-    const val LIKED_MUSIC = "VLLM"
+    const val LIKED_MUSIC = "VLLL"
 
     /** Songs explicitly added to the library — distinct from Liked Music. */
     private const val LIBRARY_SONGS = "FEmusic_liked_videos"
@@ -955,11 +984,10 @@ object YtMusicRepository {
     const val PLAYLISTS_SHELF = "Playlists"
 
     private val LIBRARY_FEEDS = listOf(
-        PLAYLISTS_SHELF to LIBRARY_PLAYLISTS,
-        "Albums" to "FEmusic_liked_albums",
-        "Artists" to "FEmusic_library_corpus_track_artists",
-        "Subscriptions" to "FEmusic_library_corpus_artists",
-        "Podcasts" to "FEmusic_library_non_music_audio_list",
+        "History" to "FEhistory",
+        PLAYLISTS_SHELF to "FEplaylist_aggregation",
+        "Liked Videos" to "VLLL",
+        "Watch Later" to "VLWL",
     )
 
     // ---- Writes -------------------------------------------------------------

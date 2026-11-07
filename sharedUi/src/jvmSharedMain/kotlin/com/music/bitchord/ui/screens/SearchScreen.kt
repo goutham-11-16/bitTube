@@ -69,6 +69,10 @@ import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import coil3.compose.AsyncImage
 import com.music.bitchord.data.model.BrowseItem
 import com.music.bitchord.data.model.BrowseType
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
+import com.music.bitchord.data.model.CARD_ART_PX
 import com.music.bitchord.data.model.ROW_ART_PX
 import com.music.bitchord.data.model.SearchFilter
 import com.music.bitchord.data.model.artworkAt
@@ -249,10 +253,11 @@ fun SearchScreen(
             // The same selector as the sources above it and a folder's tabs, so
             // the app has one look for "pick one of these".
             if (results != null && !suggesting && !searchingLibrary && !searchingAddons) {
+                val displayFilters = remember { listOf(SearchFilter.ALL, SearchFilter.VIDEOS, SearchFilter.CHANNELS, SearchFilter.PLAYLISTS) }
                 PillSegmentedControl(
-                    options = SearchFilter.entries.map { it.label },
-                    selectedIndex = filter.ordinal,
-                    onSelect = { onFilterChange(SearchFilter.entries[it]) },
+                    options = displayFilters.map { it.label },
+                    selectedIndex = displayFilters.indexOf(filter).coerceAtLeast(0),
+                    onSelect = { onFilterChange(displayFilters[it]) },
                     modifier = Modifier.padding(start = PAGE_GUTTER, end = PAGE_GUTTER, bottom = 6.dp),
                 )
             }
@@ -329,22 +334,6 @@ fun SearchScreen(
                             else -> null
                         } }
                     val isCurrentRow = playingRowMatcher(tracks, currentSong)
-                    val topResult = results.data.filterIsInstance<SearchResult.TopTrack>().firstOrNull()
-                    if (filter == SearchFilter.ALL && topResult != null) {
-                        item(key = "search:top-result:${topResult.song.videoId}") {
-                            SwipeToQueueBox(
-                                onSwipeToQueue = { onSongSwipe(topResult.song) },
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                TopResultCard(
-                                    song = topResult.song,
-                                    onPlay = { onTopResultPlay(topResult.song) },
-                                    onPlaylist = { onTopResultPlaylist(topResult.song) },
-                                    onLongPress = { onSongLongPress(topResult.song) },
-                                )
-                            }
-                        }
-                    }
                     searchSections(results.data, filter).forEach { section ->
                         section.title?.let { title ->
                             item(key = "search-section:$title") {
@@ -372,8 +361,7 @@ fun SearchScreen(
                             },
                         ) { index, row ->
                             when (row) {
-                                is SearchResult.TopTrack -> Unit
-                                is SearchResult.Track -> SongRow(
+                                is SearchResult.TopTrack -> VideoSearchCard(
                                     song = row.song,
                                     onClick = {
                                         onSongClick(tracks, tracks.indexOf(row.song).coerceAtLeast(0))
@@ -382,7 +370,16 @@ fun SearchScreen(
                                     onSwipeToQueue = { onSongSwipe(row.song) },
                                     isCurrent = isCurrentRow(row.song),
                                     isPlaying = isPlaying && isCurrentRow(row.song),
-                                    searchPlayingStyle = true,
+                                )
+                                is SearchResult.Track -> VideoSearchCard(
+                                    song = row.song,
+                                    onClick = {
+                                        onSongClick(tracks, tracks.indexOf(row.song).coerceAtLeast(0))
+                                    },
+                                    onLongPress = { onSongLongPress(row.song) },
+                                    onSwipeToQueue = { onSongSwipe(row.song) },
+                                    isCurrent = isCurrentRow(row.song),
+                                    isPlaying = isPlaying && isCurrentRow(row.song),
                                 )
                                 is SearchResult.Browse -> BrowseRow(
                                     item = row.item,
@@ -390,7 +387,7 @@ fun SearchScreen(
                                     onLongPress = onBrowseLongPress?.let { { it(row.item) } },
                                 )
                             }
-                            if (index < section.rows.lastIndex) {
+                            if (index < section.rows.lastIndex && row is SearchResult.Browse) {
                                 HorizontalDivider(
                                     modifier = Modifier.padding(start = ROW_DIVIDER_INSET),
                                     thickness = 0.5.dp,
@@ -414,16 +411,9 @@ fun SearchScreen(
 
 private data class SearchSection(val title: String?, val rows: List<SearchResult>)
 
-/** The unfiltered page is useful only when its mixed result types are readable at a glance. */
+/** YouTube search results: display in their authentic ranked relevance order. */
 private fun searchSections(rows: List<SearchResult>, filter: SearchFilter): List<SearchSection> {
-    if (filter != SearchFilter.ALL) return listOf(SearchSection(null, rows))
-    return listOf(
-        SearchSection("Songs", rows.filterIsInstance<SearchResult.Track>()),
-        SearchSection("Artists", rows.filterIsInstance<SearchResult.Browse>().filter { it.item.type == BrowseType.ARTIST }),
-        SearchSection("Albums", rows.filterIsInstance<SearchResult.Browse>().filter { it.item.type == BrowseType.ALBUM }),
-        SearchSection("Playlists", rows.filterIsInstance<SearchResult.Browse>().filter { it.item.type == BrowseType.PLAYLIST }),
-        SearchSection("More", rows.filterIsInstance<SearchResult.Browse>().filter { it.item.type == BrowseType.OTHER }),
-    ).filter { it.rows.isNotEmpty() }
+    return listOf(SearchSection(null, rows))
 }
 
 /**
@@ -1057,3 +1047,135 @@ private fun BrowseRow(item: BrowseItem, onClick: () -> Unit, onLongPress: (() ->
 
 /** How far an addon row the quality setting won't play is dimmed; Material's disabled level. */
 private const val BLOCKED_ROW_ALPHA = 0.38f
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun VideoSearchCard(
+    song: Song,
+    onClick: () -> Unit,
+    onLongPress: () -> Unit,
+    onSwipeToQueue: () -> Unit,
+    isCurrent: Boolean,
+    isPlaying: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    SwipeToQueueBox(
+        onSwipeToQueue = onSwipeToQueue,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = PAGE_GUTTER, vertical = 8.dp)
+                .clip(RoundedCornerShape(14.dp))
+                .longPressMenuClickable(onClick = onClick, onLongClick = onLongPress)
+                .contextClick(onLongPress),
+        ) {
+            // 16:9 Thumbnail
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceVariant),
+            ) {
+                AsyncImage(
+                    model = song.thumbnailUrl?.artworkAt(CARD_ART_PX),
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize(),
+                )
+                // Duration pill badge or Playing bars
+                if (isPlaying) {
+                    Box(
+                        modifier = Modifier
+                            .align(Alignment.BottomEnd)
+                            .padding(8.dp)
+                            .background(Color.Black.copy(alpha = 0.8f), RoundedCornerShape(6.dp))
+                            .padding(horizontal = 6.dp, vertical = 3.dp),
+                    ) {
+                        SearchPlayingBars()
+                    }
+                } else {
+                    val duration = song.durationText
+                    if (!duration.isNullOrBlank()) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(8.dp)
+                                .background(Color.Black.copy(alpha = 0.8f), RoundedCornerShape(6.dp))
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
+                        ) {
+                            Text(
+                                text = duration,
+                                color = Color.White,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            // Metadata Row: Avatar + Title/Channel + More button
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 2.dp),
+                verticalAlignment = Alignment.Top,
+            ) {
+                // Channel icon / Avatar circle
+                Box(
+                    modifier = Modifier
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.primaryContainer),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    if (!song.channelThumbnailUrl.isNullOrBlank()) {
+                        AsyncImage(
+                            model = song.channelThumbnailUrl,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize(),
+                        )
+                    } else if (song.artist.isNotBlank()) {
+                        Text(
+                            text = song.artist.take(1).uppercase(Locale.ROOT),
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 15.sp,
+                        )
+                    }
+                }
+
+                Spacer(Modifier.width(10.dp))
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = song.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (isCurrent) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        text = song.artist,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+
+                RowMoreButton(
+                    onClick = onLongPress,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    iconSize = 22.dp,
+                )
+            }
+        }
+    }
+}

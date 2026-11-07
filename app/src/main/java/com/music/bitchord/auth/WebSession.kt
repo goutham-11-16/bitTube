@@ -87,6 +87,35 @@ object BrowserSession {
     }
 
     /**
+     * Reads valid cookies strictly for YouTube origins (.youtube.com).
+     *
+     * Never merges cookies from accounts.google.com or google.com: Google accounts
+     * issues its own distinct SAPISID, SID, HSID, and SSID cookies. If those overwrite
+     * YouTube's cookies in the jar, YouTube's backend rejects all InnerTube API
+     * requests with HTTP 401/403 ("YouTube rejected the request") because the
+     * SAPISIDHASH signature does not match YouTube's SAPISID.
+     */
+    fun cleanYouTubeCookies(): String? {
+        val manager = runCatching { CookieManager.getInstance() }.getOrNull() ?: return null
+        manager.flush()
+        val cookieMap = mutableMapOf<String, String>()
+        YOUTUBE_ORIGINS.forEach { origin ->
+            manager.getCookie(origin)?.split(';')?.forEach { part ->
+                val eq = part.indexOf('=')
+                if (eq > 0) {
+                    val k = part.substring(0, eq).trim()
+                    val v = part.substring(eq + 1).trim()
+                    if (k.isNotEmpty() && v.isNotEmpty()) {
+                        cookieMap[k] = v
+                    }
+                }
+            }
+        }
+        val combined = cookieMap.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        return combined.takeIf { AuthStore.hasApiSid(it) }
+    }
+
+    /**
      * Forgets the Google login the in-app browser is holding.
      *
      * Google's cookies only, by name, rather than [CookieManager.removeAllCookies]:

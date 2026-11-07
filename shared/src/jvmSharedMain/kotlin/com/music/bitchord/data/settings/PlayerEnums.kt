@@ -20,10 +20,10 @@ enum class AudioQuality(
     val detail: String,
     val hourly: String,
 ) {
-    LOW(64, "Low", "~64 kbps · smallest download", "29 MB/hr"),
-    MEDIUM(Int.MAX_VALUE, "Medium", "Best available · ~171 kbps Opus", "77 MB/hr"),
-    HIGH(Int.MAX_VALUE, "High", "JioSaavn up to 320kbps, YouTube fallback", "144 MB/hr"),
-    LOSSLESS(Int.MAX_VALUE, "Lossless", "Your addons + JioSaavn, bit-exact where available", "300+ MB/hr"),
+    LOW(64, "360p · Low Data", "YouTube 360p · ~64 kbps audio", "150 MB/hr"),
+    MEDIUM(Int.MAX_VALUE, "720p · HD", "YouTube 720p · ~160 kbps audio", "600 MB/hr"),
+    HIGH(Int.MAX_VALUE, "1080p · Full HD", "YouTube 1080p · High bitrate audio", "1.5 GB/hr"),
+    LOSSLESS(Int.MAX_VALUE, "4K / 2160p · Ultra HD", "4K / 1440p · Master quality", "3+ GB/hr"),
     ;
 }
 
